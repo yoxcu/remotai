@@ -411,6 +411,13 @@ The Codex desktop app follows `ProxyJump` fine.
 
 ## Troubleshooting
 
+`docker logs work-alice` prints a `remote control:` line at boot with the
+resolved name, spawn mode, workdir and permission mode. That is the
+authoritative view — `docker exec work-alice env` shows what the CONTAINER was
+started with, which is not necessarily what the rc-loop is using, because the
+loop runs under `su -l dev` and a login shell rebuilds the environment. The
+supervisor bridges that gap through `/run/agent.env`.
+
 **`docker logs work-alice`** is the supervisor's log: sshd lifecycle, host-key
 generation, how many authorized keys it found, and a warning for any banned
 environment variable it had to strip.
@@ -421,6 +428,8 @@ environment variable it had to strip.
 | A new key on the host does not work | It syncs within ~15s **if the file was edited in place**. An editor that replaces the file gets a new inode, which the bind mount does not follow: `docker restart work-alice`. `ssh-copy-id` and `>>` append in place and are fine. |
 | Session missing from claude.ai/code | `./portal status`; then `docker exec -it work-alice su -l dev -c 'tail -40 ~/rc.log'` |
 | rc loop says "not signed in" | `./portal setup alice` |
+| Session appears as `dev@<container-name>` | Pre-fix container: the AGENT_* vars were lost across `su -l`. Rebuild with `./portal update`. |
+| `permission_mode` set but sessions still prompt | Check the `remote control:` line in `docker logs`, and the `starting:` line in `rc.log`, for `--permission-mode=`. Env vars alone do not prove it arrived. |
 | `Worktree mode requires a git repository` in rc.log | `spawn: worktree` with a `workdir` that is not a repo. Set `spawn: same-dir`, or point `workdir` at a repo. Newer containers fall back automatically and say so. |
 | Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/bin/codex` |
 | `codex login --device-auth` refused by the workspace | Use the SSH tunnel: `ssh -L 1455:localhost:1455 -p 22NN dev@host`, then `codex login` in that session. |

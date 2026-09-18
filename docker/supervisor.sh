@@ -42,20 +42,51 @@ EXTRA_AKEYS="${EXTRA_AKEYS:-/run/portal-keys/extra}"
 AKEYS="${AKEYS:-/etc/ssh/authorized_keys.d/dev}"
 AKEYS_POLL="${AKEYS_POLL:-15}"
 
-AGENT_NAME="${AGENT_NAME:-${DEV_USER}}"
-AGENT_HOST="${AGENT_HOST:-$(hostname)}"
-AGENT_CLAUDE="${AGENT_CLAUDE:-0}"
-# same-dir (default): every session shares the working directory.
-# worktree:           each session gets its own git worktree — REQUIRES the working
-#                     directory to be a git repository.
-# session:            one session, capacity 1, exits when complete.
-AGENT_SPAWN="${AGENT_SPAWN:-same-dir}"
-# Passed through to `--permission-mode=`. Empty means "do not pass the flag",
-# leaving Claude Code's own default. bypassPermissions is the "stop asking me"
-# setting: the agent runs tools without prompting, so the container IS the
-# safety boundary.
-AGENT_PERMISSION_MODE="${AGENT_PERMISSION_MODE:-}"
-AGENT_WORKDIR="${AGENT_WORKDIR:-${PROJECTS}}"
+# The rc-loop runs under `su -l dev`, and a LOGIN shell rebuilds the environment
+# from scratch: not one AGENT_* variable the container was started with survives
+# into it. So the supervisor resolves them once, writes them here, and the
+# rc-loop reads them back.
+#
+# Getting this wrong fails silently and confusingly — every value falls back to
+# its default, so the session registers as dev@<container-hostname> with no
+# permission mode, and the env vars look perfectly correct from `docker exec`.
+AGENT_ENV_FILE="${AGENT_ENV_FILE:-/run/agent.env}"
+
+agent_defaults() {
+    AGENT_NAME="${AGENT_NAME:-${DEV_USER}}"
+    AGENT_HOST="${AGENT_HOST:-$(hostname)}"
+    AGENT_CLAUDE="${AGENT_CLAUDE:-0}"
+    # same-dir (default): every session shares the working directory.
+    # worktree:  each session gets its own git worktree — REQUIRES the working
+    #            directory to be a git repository.
+    # session:   one session, capacity 1, exits when complete.
+    AGENT_SPAWN="${AGENT_SPAWN:-same-dir}"
+    # Passed through to `--permission-mode=`. Empty means "do not pass the flag",
+    # leaving Claude Code's own default. bypassPermissions is the "stop asking
+    # me" setting: the agent runs tools without prompting, so the container IS
+    # the safety boundary.
+    AGENT_PERMISSION_MODE="${AGENT_PERMISSION_MODE:-}"
+    AGENT_WORKDIR="${AGENT_WORKDIR:-${PROJECTS}}"
+}
+
+write_agent_env() {
+    local tmp="${AGENT_ENV_FILE}.tmp"
+    {
+        printf 'AGENT_NAME=%q\n'            "${AGENT_NAME}"
+        printf 'AGENT_HOST=%q\n'            "${AGENT_HOST}"
+        printf 'AGENT_CLAUDE=%q\n'          "${AGENT_CLAUDE}"
+        printf 'AGENT_SPAWN=%q\n'           "${AGENT_SPAWN}"
+        printf 'AGENT_PERMISSION_MODE=%q\n' "${AGENT_PERMISSION_MODE}"
+        printf 'AGENT_WORKDIR=%q\n'         "${AGENT_WORKDIR}"
+    } >"${tmp}" && mv -f "${tmp}" "${AGENT_ENV_FILE}"
+    chmod 0644 "${AGENT_ENV_FILE}" 2>/dev/null || true
+}
+
+read_agent_env() {
+    [ -r "${AGENT_ENV_FILE}" ] || return 0
+    # shellcheck source=/dev/null
+    . "${AGENT_ENV_FILE}"
+}
 
 log() { printf '[%s] supervisor: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 rc_log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"${RC_LOG}"; }
@@ -334,9 +365,10 @@ shutdown() {
 # loop does not need a second file.
 case "${1:-supervise}" in
     rc-loop)
-        # su -l already rebuilds the environment, but be certain: a single
-        # inherited ANTHROPIC_API_KEY here would silently stop every session
-        # from appearing.
+        # Read back what the supervisor resolved; `su -l` threw the real
+        # environment away on the way in.
+        read_agent_env
+        agent_defaults
         scrub_env
         rc_loop
         exit $?
@@ -348,8 +380,14 @@ case "${1:-supervise}" in
         ;;
 esac
 
+agent_defaults
 scrub_env
+write_agent_env
 log "work container for '${AGENT_NAME}' on host '${AGENT_HOST}'"
+if [ "${AGENT_CLAUDE}" = "1" ]; then
+    log "remote control: name=${AGENT_NAME}@${AGENT_HOST} spawn=${AGENT_SPAWN}" \
+        "workdir=${AGENT_WORKDIR} permission-mode=${AGENT_PERMISSION_MODE:-<claude default>}"
+fi
 seed_home
 ensure_host_keys
 check_authorized_keys

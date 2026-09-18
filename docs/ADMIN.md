@@ -101,7 +101,21 @@ It walks through, in order:
    prompt. Claude Code never persists trust for `$HOME`, which is exactly why
    the server runs from `~/projects` and not from the home directory.
 3. Running `claude remote-control` once to answer **"Enable Remote Control?"**.
-4. `codex login --device-auth` — another URL-and-code flow.
+4. Codex login, which offers a choice because Codex has no headless flow of its
+   own. `codex login` serves an OAuth callback on `localhost:1455` and wants a
+   browser there:
+   - **SSH tunnel** (default, works everywhere): Alice runs
+     `ssh -L 1455:localhost:1455 -p 2201 dev@<server>` from her own machine and
+     then `codex login` inside that session. The tunnel must terminate *in the
+     container* — the container has its own network namespace, so `docker exec`
+     cannot carry the callback.
+   - **`--device-auth`**: no tunnel, but many ChatGPT workspaces disable it and
+     answer `Please contact your workspace admin to enable device code
+     authentication`.
+   - If both are impossible, `portal setup` prints the last-resort `scp` of
+     `~/.codex/auth.json` from a machine where she is already signed in. It
+     carries the refresh token so it keeps working, but it ties the container to
+     that same install.
 5. Restarting the container so the supervised loop takes over.
 
 While setup runs, `portal` drops `/home/dev/.rc-paused` so the background loop
@@ -350,6 +364,7 @@ environment variable it had to strip.
 | Session missing from claude.ai/code | `./portal status`; then `docker exec -it work-alice su -l dev -c 'tail -40 ~/rc.log'` |
 | rc loop says "not signed in" | `./portal setup alice` |
 | Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/bin/codex` |
+| `codex login --device-auth` refused by the workspace | Use the SSH tunnel: `ssh -L 1455:localhost:1455 -p 22NN dev@host`, then `codex login` in that session. |
 | Host key changed for everyone after an update | Should not happen — keys live in the home volume. If it did, the volume was recreated. |
 | Container restart-looping | `docker logs work-alice`; a corrupt home volume is the usual cause. |
 

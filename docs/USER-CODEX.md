@@ -53,7 +53,41 @@ If the first works and the second prints nothing, the app will fail with
 something unhelpful like "could not start app server". Tell your admin — it is a
 PATH problem on the server side, not something you can fix from here.
 
-## 3. Add the host in the app
+## 3. Signing Codex in (one time)
+
+Your admin normally does this with you via `portal setup`. If you are doing it
+yourself, note that `codex login` serves an OAuth callback on `localhost:1455`
+and expects a browser on the same machine — neither is true inside a container.
+
+**Forward the port into the container over SSH.** The tunnel has to end up
+*inside* the container, which is why this uses your container's port and not a
+shell on the server:
+
+```sh
+ssh -L 1455:localhost:1455 -p 2201 dev@your-server
+```
+
+Then, in that same SSH session:
+
+```sh
+codex login
+```
+
+It prints a URL. Open it in your own browser. The redirect back to
+`localhost:1455` travels down the tunnel into the container, and your login is
+written to `~/.codex` — on the persistent volume, so it survives image updates.
+
+`codex login --device-auth` avoids the tunnel entirely, but many ChatGPT
+workspaces disable it ("contact your workspace admin to enable device code
+authentication"). If yours does, use the tunnel.
+
+Check it worked:
+
+```sh
+codex login status
+```
+
+## 4. Add the host in the app
 
 1. Open the Codex desktop app.
 2. **Settings → Connections**.
@@ -66,7 +100,7 @@ The app opens the connection, launches `codex app-server` in your container, and
 you are working against the server's filesystem — your repos are under
 `~/projects`.
 
-## 4. Working in the terminal instead
+## 5. Working in the terminal instead
 
 Nothing stops you from using Codex over plain SSH:
 
@@ -85,17 +119,18 @@ tmux new -s work     # later: tmux attach -t work
 Note that `rc` is a reserved session name — that is the Claude Remote Control
 loop, if you have Claude enabled too. Leave it alone.
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | `Permission denied (publickey)` | Your container reads your **own** `~/.ssh/authorized_keys` on the server. Add the key there (`ssh-copy-id`, or append to the file) and it works within ~15s — no admin needed. If you have no account on the server, your admin adds the key to `extra_keys` instead. |
 | App says it cannot start the app server | Run the `ssh -T agent-work 'command -v codex'` check above. |
 | Connection drops after idle | Check `ServerAliveInterval` is in your config. |
-| `codex` says you are not logged in | The one-time `codex login` did not complete. Ask your admin to rerun `portal setup <you>`. |
+| `codex` says you are not logged in | The one-time `codex login` did not complete — see section 3. |
+| `Please contact your workspace admin to enable device code authentication` | Your ChatGPT workspace blocks `--device-auth`. Use the SSH tunnel in section 3 instead. |
 | Host key changed warning | Only expected if your container's home volume was recreated. Confirm with your admin before removing the old key. |
 
-## 6. Please don't
+## 7. Please don't
 
 Don't add the container to shared automation or CI. Your container is signed in
 with **your** account, and everything run in it is attributed to you.

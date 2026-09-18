@@ -603,14 +603,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
         if user["codex"]:
             n += 1
             _step(n, total, "codex login")
-            print("Codex uses a device-code flow: it prints a URL and a code, you approve\n"
-                  "it in a browser on your own machine.\n")
-            exec_in(name, "cd /home/dev/projects && codex login --device-auth", tty=True)
-            status = exec_in(name, "codex login status")
-            if status.returncode != 0:
-                warn("codex still reports no login:\n" + (status.stdout or status.stderr).strip())
-            else:
-                info("codex signed in")
+            codex_login(cfg, user)
     finally:
         exec_in(name, "rm -f /home/dev/.rc-paused")
 
@@ -627,6 +620,72 @@ def cmd_setup(args: argparse.Namespace) -> None:
     print()
     print("Attach to the live session any time with:")
     print(f"     ssh -p {user['port']} dev@{agent_host(cfg)} -t 'tmux attach -t rc'")
+
+
+CODEX_LOGIN_PORT = 1455
+
+
+def codex_login(cfg: dict, user: dict) -> None:
+    """Walk through whichever Codex login flow this workspace still allows.
+
+    `codex login` runs a local OAuth callback server on localhost:1455 and
+    expects a browser on the same machine. In a container neither is true, so
+    there are two ways in:
+
+      1. Forward 1455 from the operator's machine INTO the container over SSH.
+         The tunnel has to terminate in the container, not on the host, because
+         the container has its own network namespace — which means SSH, not
+         docker exec.
+      2. `--device-auth`, which needs no tunnel but which some ChatGPT
+         workspaces disable ("contact your workspace admin to enable device
+         code authentication").
+    """
+    name = user["name"]
+    port = user["port"]
+    host = agent_host(cfg)
+
+    print("Codex has no headless login of its own: `codex login` serves an OAuth\n"
+          f"callback on localhost:{CODEX_LOGIN_PORT} and wants a browser there.\n")
+    print("  1. SSH tunnel   — works even when device code is disabled (recommended)")
+    print("  2. Device code  — no tunnel, but many workspaces block it")
+    print("  3. Skip         — do it later\n")
+    choice = (input("which? [1] ") or "1").strip()
+
+    if choice == "2":
+        exec_in(name, "cd /home/dev/projects && codex login --device-auth", tty=True)
+    elif choice == "3":
+        warn(f"skipped; rerun './portal setup {name}' when ready")
+        return
+    else:
+        print()
+        print("On YOUR machine (not this server), in a second terminal:\n")
+        print(_c("1", f"    ssh -L {CODEX_LOGIN_PORT}:localhost:{CODEX_LOGIN_PORT} "
+                      f"-p {port} dev@{host}"))
+        print()
+        print("Then, inside that SSH session:\n")
+        print(_c("1", "    codex login"))
+        print()
+        print("It prints a URL. Open it in your own browser. When it redirects to\n"
+              f"localhost:{CODEX_LOGIN_PORT} the tunnel carries the callback back into the\n"
+              "container, and the login lands in ~/.codex — which is on the persistent\n"
+              "volume, so it survives every `portal update`.\n")
+        input("press enter once that has finished … ")
+
+    status = exec_in(name, "codex login status")
+    if status.returncode == 0:
+        info("codex signed in")
+        return
+
+    warn("codex still reports no login:\n       "
+         + (status.stdout or status.stderr).strip().replace("\n", "\n       "))
+    print()
+    print("If device code is disabled AND the tunnel is awkward, the last resort is\n"
+          "to log in on your own machine and copy the credentials over:\n")
+    print(_c("1", f"    ssh -p {port} dev@{host} 'mkdir -p ~/.codex'"))
+    print(_c("1", f"    scp -P {port} ~/.codex/auth.json dev@{host}:~/.codex/auth.json"))
+    print()
+    print("That carries the refresh token, so it keeps working — but it ties this\n"
+          "container to the same account as your laptop's Codex. Prefer the tunnel.")
 
 
 def _probe(name: str, state: str, quick: bool) -> dict:

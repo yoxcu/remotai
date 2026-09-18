@@ -800,12 +800,19 @@ def cmd_render(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # allow_abbrev=False everywhere: argparse otherwise accepts any unambiguous
+    # prefix, so `--code` silently becomes `--codex` and a Claude-only user
+    # quietly gets Codex enabled. Typos should be errors, not guesses.
     parser = argparse.ArgumentParser(
-        prog="portal", description=__doc__,
+        prog="portal", description=__doc__, allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("add", help="create a work container for a person")
+    def add_parser(*a, **kw):
+        # Subparsers do not inherit allow_abbrev from the parent.
+        return sub.add_parser(*a, allow_abbrev=False, **kw)
+
+    p = add_parser("add", help="create a work container for a person")
     p.add_argument("name")
     p.add_argument("--key", action="append", metavar="PUBKEY|PATH|-",
                    help="extra public key recorded in users.yaml, on top of the "
@@ -824,34 +831,34 @@ def main() -> None:
     p.add_argument("--port", type=int, help="host sshd port (default: next free from 2201)")
     p.set_defaults(func=cmd_add)
 
-    p = sub.add_parser("setup", help="one-time interactive logins (needs a TTY)")
+    p = add_parser("setup", help="one-time interactive logins (needs a TTY)")
     p.add_argument("name")
     p.set_defaults(func=cmd_setup)
 
-    p = sub.add_parser("status", help="show every container and its login state")
+    p = add_parser("status", help="show every container and its login state")
     p.add_argument("-q", "--quick", action="store_true",
                    help="skip the in-container probes (much faster)")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("build", help="build agent-base:latest and stop (no containers touched)")
+    p = add_parser("build", help="build agent-base:latest and stop (no containers touched)")
     p.add_argument("--no-pull", action="store_true",
                    help="build without forcing a fresh npm install")
     p.set_defaults(func=cmd_build)
 
-    p = sub.add_parser("update", help="rebuild the image with the latest claude/codex "
+    p = add_parser("update", help="rebuild the image with the latest claude/codex "
                                       "and recreate all containers")
     p.add_argument("--no-pull", action="store_true",
                    help="rebuild without forcing a fresh npm install")
     p.set_defaults(func=cmd_update)
 
-    p = sub.add_parser("rm", help="remove a user's container")
+    p = add_parser("rm", help="remove a user's container")
     p.add_argument("name")
     p.add_argument("--purge", action="store_true",
                    help="also delete their home volume and project directory")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask")
     p.set_defaults(func=cmd_rm)
 
-    p = sub.add_parser("render", help="re-render compose.users.yml and authorized_keys")
+    p = add_parser("render", help="re-render compose.users.yml and authorized_keys")
     p.set_defaults(func=cmd_render)
 
     args = parser.parse_args()

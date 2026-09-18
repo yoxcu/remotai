@@ -29,6 +29,12 @@ GSSAPIAuthentication no
 HostbasedAuthentication no
 UsePAM yes
 
+# VERBOSE logs the fingerprint of every key offered and names the reason an
+# auth attempt failed. On a host where the only way in is a key you did not
+# personally install, "Permission denied (publickey)" with no reason logged is
+# not a debuggable state. Goes to the container's stdout: docker logs work-<n>.
+LogLevel VERBOSE
+
 X11Forwarding no
 AllowTcpForwarding yes
 PermitTunnel no

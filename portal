@@ -5,6 +5,7 @@ users.yaml is the single source of truth. Everything else — compose.users.yml,
 the authorized_keys files under /srv/agents, the containers themselves — is
 rendered from it and is safe to throw away.
 
+    ./portal build              build agent-base:latest
     ./portal add <name> --key <pubkey|path> [--claude] [--codex]
     ./portal setup <name>       one-time interactive logins (needs a TTY)
     ./portal status [-q]
@@ -535,6 +536,10 @@ def cmd_status(args: argparse.Namespace) -> None:
     _print_status_rows(cfg, cfg["users"], quick=args.quick)
 
 
+def cmd_build(args: argparse.Namespace) -> None:
+    build_image(load_config(required=False), refresh=not args.no_pull)
+
+
 def cmd_update(args: argparse.Namespace) -> None:
     cfg = load_config()
     build_image(cfg, refresh=not args.no_pull)
@@ -608,6 +613,11 @@ def main() -> None:
     p.add_argument("-q", "--quick", action="store_true",
                    help="skip the in-container probes (much faster)")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("build", help="build agent-base:latest and stop (no containers touched)")
+    p.add_argument("--no-pull", action="store_true",
+                   help="build without forcing a fresh npm install")
+    p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("update", help="rebuild the image with the latest claude/codex "
                                       "and recreate all containers")

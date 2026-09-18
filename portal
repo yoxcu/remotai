@@ -34,9 +34,16 @@ try:
     import yaml
 except ImportError:
     sys.exit(
-        "portal needs PyYAML.\n"
+        f"portal needs PyYAML, and {sys.executable} cannot import it.\n"
+        "  Arch/Manjaro:  sudo pacman -S python-yaml\n"
         "  Debian/Ubuntu: sudo apt-get install -y python3-yaml\n"
-        "  otherwise:     pip install PyYAML"
+        "  Fedora/RHEL:   sudo dnf install python3-pyyaml\n"
+        "  any of them:   pip install PyYAML\n"
+        "\n"
+        "If the distro package is already installed, this interpreter is not the\n"
+        "system one (a venv, pyenv, mise or conda build cannot see distro\n"
+        "site-packages). Either install PyYAML into it, or run the system python\n"
+        "explicitly:  /usr/bin/python3 ./portal ..."
     )
 
 ROOT = Path(__file__).resolve().parent

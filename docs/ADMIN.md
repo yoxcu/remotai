@@ -13,7 +13,9 @@ to delete and regenerate. No container is given the Docker socket.
 ## Requirements
 
 - Docker Engine with the Compose v2 plugin
-- Python 3 with PyYAML (`apt-get install -y python3-yaml`)
+- Python 3 with PyYAML — `pacman -S python-yaml` (Arch/Manjaro),
+  `apt-get install -y python3-yaml` (Debian/Ubuntu), or `pip install PyYAML`.
+  It must be importable by whichever `python3` is first on your PATH.
 - A user who can talk to Docker, and who can write `/srv/agents`
 
 ## First run

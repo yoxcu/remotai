@@ -116,7 +116,16 @@ say "preflight"
 for bin in docker ssh ssh-keygen python3; do
     command -v "${bin}" >/dev/null || { echo "missing: ${bin}"; exit 99; }
 done
-python3 -c 'import yaml' 2>/dev/null || { echo "missing: python3 PyYAML"; exit 99; }
+if ! err=$(python3 -c 'import yaml' 2>&1); then
+    echo "python3 cannot import yaml:"
+    echo "   interpreter: $(command -v python3) ($(python3 -V 2>&1))"
+    echo "   ${err##*$'\n'}"
+    echo "   install it:  pacman -S python-yaml | apt-get install python3-yaml | pip install PyYAML"
+    echo "   note: if python3 is a venv/pyenv/conda build, the distro package"
+    echo "         will not be visible to it — install into that interpreter,"
+    echo "         or run with a system python: /usr/bin/python3 ./portal ..."
+    exit 99
+fi
 docker compose version >/dev/null 2>&1 || { echo "missing: docker compose v2"; exit 99; }
 if [ -f users.yaml ] && grep -qE "^\s*-?\s*name:\s*${USER_NAME}\s*$" users.yaml; then
     echo "refusing to run: a real user called '${USER_NAME}' already exists in users.yaml"

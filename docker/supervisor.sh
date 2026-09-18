@@ -12,8 +12,8 @@
 
 set -uo pipefail
 
-DEV_USER=dev
-DEV_HOME=/home/dev
+DEV_USER="${DEV_USER:-dev}"
+DEV_HOME="${DEV_HOME:-/home/dev}"
 PROJECTS="${DEV_HOME}/projects"
 HOST_KEY_DIR="${DEV_HOME}/.ssh/host_keys"
 RC_LOG="${DEV_HOME}/rc.log"
@@ -23,9 +23,9 @@ RC_LOG="${DEV_HOME}/rc.log"
 # detached pane). Removed again at the end of setup.
 RC_PAUSE="${DEV_HOME}/.rc-paused"
 RC_SESSION=rc
-RC_RESTART_DELAY=5      # seconds between `claude remote-control` attempts
-RC_AUTH_POLL=30         # seconds between re-checks while not logged in
-RC_SUPERVISE_POLL=10    # seconds between "is the tmux session still there"
+RC_RESTART_DELAY="${RC_RESTART_DELAY:-5}"      # between `claude remote-control` attempts
+RC_AUTH_POLL="${RC_AUTH_POLL:-30}"             # between re-checks while not logged in
+RC_SUPERVISE_POLL="${RC_SUPERVISE_POLL:-10}"   # between "is the tmux session alive"
 RC_LOG_MAX=$(( 8 * 1024 * 1024 ))
 
 AGENT_NAME="${AGENT_NAME:-${DEV_USER}}"

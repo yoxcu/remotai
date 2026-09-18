@@ -17,6 +17,11 @@ DEV_HOME=/home/dev
 PROJECTS="${DEV_HOME}/projects"
 HOST_KEY_DIR="${DEV_HOME}/.ssh/host_keys"
 RC_LOG="${DEV_HOME}/rc.log"
+# `portal setup` drops this file while it walks a user through the one-time
+# interactive logins, so the supervised loop does not race it for the same
+# directory (and does not swallow the "Enable Remote Control?" prompt in a
+# detached pane). Removed again at the end of setup.
+RC_PAUSE="${DEV_HOME}/.rc-paused"
 RC_SESSION=rc
 RC_RESTART_DELAY=5      # seconds between `claude remote-control` attempts
 RC_AUTH_POLL=30         # seconds between re-checks while not logged in
@@ -73,6 +78,8 @@ seed_home() {
     # Not recursive and not the bind mount: /home/dev/projects belongs to the
     # host and is already owned correctly by `portal add`.
     touch "${RC_LOG}" && chown "${DEV_USER}:${DEV_USER}" "${RC_LOG}"
+    # A container that died mid-setup must not come back paused forever.
+    rm -f "${RC_PAUSE}"
 }
 
 ensure_host_keys() {
@@ -131,6 +138,12 @@ rc_loop() {
 
     local rc
     while :; do
+        if [ -f "${RC_PAUSE}" ]; then
+            rc_log "paused by 'portal setup'; re-checking in ${RC_AUTH_POLL}s"
+            sleep "${RC_AUTH_POLL}"
+            continue
+        fi
+
         # Rotate rather than let an unattended container fill its volume.
         if [ -f "${RC_LOG}" ] && [ "$(stat -c %s "${RC_LOG}" 2>/dev/null || echo 0)" -gt "${RC_LOG_MAX}" ]; then
             mv -f "${RC_LOG}" "${RC_LOG}.1"
@@ -159,6 +172,10 @@ rc_loop() {
 
 supervise_rc() {
     while :; do
+        if [ -f "${RC_PAUSE}" ]; then
+            sleep "${RC_SUPERVISE_POLL}"
+            continue
+        fi
         if ! as_dev "tmux has-session -t ${RC_SESSION}" >/dev/null 2>&1; then
             log "creating tmux session '${RC_SESSION}'"
             as_dev "tmux new-session -d -s ${RC_SESSION} -c ${PROJECTS} '/usr/local/bin/supervisor.sh rc-loop'" \

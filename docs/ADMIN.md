@@ -24,8 +24,18 @@ cp users.yaml.example users.yaml      # optional; `portal add` creates it too
 ```
 
 The image bakes in the UID/GID that `portal` is running as, so bind-mounted
-projects are writable from both sides. Override with `uid:`/`gid:` in
-`users.yaml` if you want something else.
+projects are writable from both sides. Under `sudo` it uses `SUDO_UID`/`SUDO_GID`
+— your own account, not root — and a true root shell falls back to 1000. Pin it
+explicitly with `uid:`/`gid:` in `users.yaml` if more than one person runs
+`portal`, since changing it rebuilds the image.
+
+`portal` needs to write `srv_root` (`/srv/agents` by default). Either run it with
+`sudo`, or hand yourself the directory once and run it as yourself:
+
+```sh
+sudo install -d -o "$USER" -g "$USER" /srv/agents
+sudo usermod -aG docker "$USER"      # log out and back in
+```
 
 ---
 

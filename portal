@@ -146,8 +146,28 @@ def agent_host(cfg: dict) -> str:
 
 def build_uid_gid(cfg: dict) -> tuple[int, int]:
     """UID/GID baked into the image, so bind-mounted projects are writable
-    from both the host and the container without any chown dance."""
-    return int(cfg.get("uid", os.getuid())), int(cfg.get("gid", os.getgid()))
+    from both the host and the container without any chown dance.
+
+    Pin them with `uid:`/`gid:` in users.yaml if portal gets run by different
+    people — changing them rebuilds the image.
+    """
+    uid = cfg.get("uid")
+    gid = cfg.get("gid")
+    # Under sudo, getuid() is 0. Baking that in would mean `useradd -u 0 dev`,
+    # which collides with root and fails the build — so prefer the invoking
+    # user, and fall back to 1000 for a genuine root shell.
+    if uid is None:
+        uid = int(os.environ.get("SUDO_UID") or os.getuid())
+    if gid is None:
+        gid = int(os.environ.get("SUDO_GID") or os.getgid())
+    uid, gid = int(uid), int(gid)
+    if uid == 0 or gid == 0:
+        warn("running as root with no SUDO_UID to fall back on; building the "
+             "image with uid/gid 1000. Set uid:/gid: in users.yaml to pin this "
+             "to whoever owns your project directories.")
+        uid = uid or 1000
+        gid = gid or 1000
+    return uid, gid
 
 
 # ---------------------------------------------------------------------------

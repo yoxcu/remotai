@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import re
 import shutil
@@ -495,7 +496,17 @@ def _probe(name: str, state: str, quick: bool) -> dict:
     row = {"state": state, "claude": "-", "codex": "-", "rc": "-", "last": ""}
     if quick or state != "running":
         return row
-    row["claude"] = "ok" if exec_in(name, "claude auth status").returncode == 0 else "NO LOGIN"
+    # `claude auth status` exits non-zero when logged out and otherwise prints
+    # JSON. Show authMethod rather than a bare "ok": an API-key login reports
+    # itself as logged in but Remote Control will never work with it.
+    res = exec_in(name, "claude auth status")
+    if res.returncode != 0:
+        row["claude"] = "NO LOGIN"
+    else:
+        try:
+            row["claude"] = (json.loads(res.stdout).get("authMethod") or "ok")[:9]
+        except (ValueError, TypeError):
+            row["claude"] = "ok"
     row["codex"] = "ok" if exec_in(name, "codex login status").returncode == 0 else "NO LOGIN"
     row["rc"] = "up" if exec_in(name, "tmux has-session -t rc").returncode == 0 else "down"
     tail = exec_in(name, "tail -n 1 /home/dev/rc.log 2>/dev/null")

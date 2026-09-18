@@ -34,6 +34,7 @@ KEY="${WORK}/id_ed25519"
 KNOWN="${WORK}/known_hosts"
 CONTAINER="work-${USER_NAME}"
 BACKUP="${WORK}/users.yaml.bak"
+HAD_USERS_YAML=0
 
 PASS=0
 FAIL=0
@@ -92,15 +93,18 @@ wait_for() {   # wait_for <seconds> <command...>
 
 cleanup() {
     say "cleanup"
-    if [ -f "${BACKUP}" ] || ./portal status -q 2>/dev/null | grep -q "^${USER_NAME} "; then
+    if ./portal status -q 2>/dev/null | grep -q "^${USER_NAME} "; then
         ./portal rm "${USER_NAME}" --purge --yes >/dev/null 2>&1 \
             && echo "   removed ${CONTAINER}, volume and /srv/agents/${USER_NAME}" \
             || echo "   (nothing to remove)"
     fi
-    if [ -f "${BACKUP}" ]; then
+    if [ "${HAD_USERS_YAML}" = 1 ] && [ -f "${BACKUP}" ]; then
         mv -f "${BACKUP}" "${ROOT}/users.yaml"
         ./portal render >/dev/null 2>&1
         echo "   restored users.yaml"
+    elif [ "${HAD_USERS_YAML}" = 0 ]; then
+        # There was no users.yaml before this run; do not leave one behind.
+        rm -f "${ROOT}/users.yaml" "${ROOT}/compose.users.yml"
     fi
     rm -rf "${WORK}"
 }
@@ -125,7 +129,7 @@ fi
 echo "   ok"
 
 mkdir -p "${WORK}"
-[ -f users.yaml ] && cp -a users.yaml "${BACKUP}"
+if [ -f users.yaml ]; then HAD_USERS_YAML=1; cp -a users.yaml "${BACKUP}"; fi
 ssh-keygen -q -t ed25519 -N '' -f "${KEY}" -C 'smoke-test' </dev/null
 
 say "1. build agent-base"
@@ -210,20 +214,24 @@ check_out "rc.log records the loop waiting for a login" 'portal setup' \
 
 say "8. supervisor restarts what dies"
 before=$(ssh_cmd 'wc -l < ~/rc.log' 2>/dev/null | tr -d ' \r')
-ssh_cmd 'pkill -f "supervisor.sh rc-loop"' >/dev/null 2>&1
-if wait_for 90 bash -c "
-    now=\$(ssh -i '${KEY}' -p '${PORT}' -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile='${KNOWN}' -o LogLevel=ERROR -T dev@${SSH_HOST} \
-        'tmux has-session -t rc && wc -l < ~/rc.log' 2>/dev/null | tr -d ' \r')
-    [ -n \"\$now\" ] && [ \"\$now\" -gt '${before:-0}' ]"; then
+ssh_cmd 'pkill -f "supervisor[.]sh rc-loop"' >/dev/null 2>&1
+restarted=0
+deadline=$(( SECONDS + 90 ))
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+    sleep 3
+    ssh_cmd 'tmux has-session -t rc' >/dev/null 2>&1 || continue
+    after=$(ssh_cmd 'wc -l < ~/rc.log' 2>/dev/null | tr -d ' \r')
+    if [ -n "${after}" ] && [ "${after}" -gt "${before:-0}" ]; then restarted=1; break; fi
+done
+if [ "${restarted}" = 1 ]; then
     ok "killed rc loop is restarted and rc.log keeps growing"
+    note "rc.log ${before:-0} -> ${after} lines"
 else
     bad "killed rc loop is restarted and rc.log keeps growing"
-    note "rc.log before=${before:-?} after=$(ssh_cmd 'wc -l < ~/rc.log' 2>/dev/null | tr -d ' ')"
+    note "rc.log before=${before:-?} after=${after:-?}"
 fi
 
-docker exec "${CONTAINER}" tmux -S /tmp/tmux-*/default kill-server >/dev/null 2>&1 \
-    || docker exec -u dev "${CONTAINER}" tmux kill-server >/dev/null 2>&1
+docker exec -u dev "${CONTAINER}" tmux kill-server >/dev/null 2>&1
 if wait_for 90 ssh_cmd 'tmux has-session -t rc'; then
     ok "killed tmux server is recreated by the supervisor"
 else

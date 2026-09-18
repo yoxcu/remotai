@@ -210,6 +210,10 @@ shutdown() {
 # loop does not need a second file.
 case "${1:-supervise}" in
     rc-loop)
+        # su -l already rebuilds the environment, but be certain: a single
+        # inherited ANTHROPIC_API_KEY here would silently stop every session
+        # from appearing.
+        scrub_env
         rc_loop
         exit $?
         ;;

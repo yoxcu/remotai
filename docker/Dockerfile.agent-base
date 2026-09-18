@@ -87,7 +87,10 @@ RUN userdel -r ubuntu 2>/dev/null || true; \
     useradd -m -u "${DEV_UID}" -g "${DEV_GID}" -s /bin/bash dev; \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-dev; \
     chmod 0440 /etc/sudoers.d/90-dev; \
-    passwd -l dev
+    # '*' (no password will ever match) rather than passwd -l's '!': a locked
+    # account can trip pam_unix's account phase on key-only logins. This is the
+    # convention the Ubuntu cloud images use.
+    usermod -p '*' dev
 
 # ---------------------------------------------------------------------------
 # 5. sshd.

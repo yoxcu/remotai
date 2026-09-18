@@ -192,6 +192,37 @@ Or for an existing user, set `spawn:` and `workdir:` in `users.yaml` and run
 
 ---
 
+## Permission mode
+
+By default Claude Code asks before it runs tools. To let an agent work
+unattended — which is rather the point of a Remote Control host — set a
+permission mode:
+
+```sh
+./portal add alice --claude --skip-permissions          # = bypassPermissions
+./portal add alice --claude --permission-mode acceptEdits
+```
+
+Or `permission_mode:` in `users.yaml` for an existing user, then
+`./portal update`. Valid modes: `default`, `acceptEdits`, `auto`,
+`bypassPermissions`, `manual`, `dontAsk`, `plan`. Omitting it passes no flag at
+all, leaving Claude Code's default.
+
+Note `remote-control` does **not** accept `--dangerously-skip-permissions` —
+that flag belongs to the main CLI. `--permission-mode=bypassPermissions` is the
+equivalent here, and it is what `--skip-permissions` sets.
+
+Be clear-eyed about `bypassPermissions` on this host: the agent runs commands
+without asking, in a container that has network access and passwordless sudo.
+The container boundary is then the only thing between it and your server. That
+is a reasonable trade for a per-person sandbox — it is not a reasonable trade if
+you have mounted anything sensitive into `/srv/agents`.
+
+`remote-control` also accepts `--sandbox`, which is a separate hardening knob
+and not currently wired through `portal`. Ask if you want it.
+
+---
+
 ## Rotating and revoking keys
 
 **A key the person controls.** Nothing to run: Alice edits

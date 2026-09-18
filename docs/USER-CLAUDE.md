@@ -93,7 +93,15 @@ passwordless sudo, but the container is rebuilt from a fresh image on every
   `npm install -g` after `npm config set prefix ~/.npm-global` (already on your
   PATH).
 
-## 4. Adding a machine
+## 4. Permission prompts
+
+Your admin may have set a permission mode for your container. With
+`bypassPermissions`, sessions run tools without stopping to ask you — good for
+unattended work, and the reason the container is isolated in the first place.
+With the default, you will be asked, which is awkward for a session you are not
+watching. `./portal status` shows the mode; ask your admin to change it.
+
+## 5. Adding a machine
 
 Your container accepts exactly the keys in your **own**
 `~/.ssh/authorized_keys` on the server — the same file you already use to log
@@ -114,7 +122,7 @@ file.
 Your admin can also add keys directly (`extra_keys` in `users.yaml`), which is
 how a machine with no account on this server gets in.
 
-## 5. Housekeeping
+## 6. Housekeeping
 
 `~/rc.log` is the server's own log — start/stop times, exit codes, and anything
 it wrote to stderr:
@@ -131,7 +139,7 @@ hours after a restart):
 tmux attach -t rc     # Ctrl-C, then watch it come back
 ```
 
-## 6. Please don't
+## 7. Please don't
 
 Do not set `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
 `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_BASE_URL` in your `~/.bashrc` or

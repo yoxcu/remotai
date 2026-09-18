@@ -43,6 +43,11 @@ users:
     # Where the server runs. /home/dev/projects holds repos but is not itself
     # one, so point workdir at a repo if you want spawn: worktree.
     workdir: /home/dev/projects
+    # Passed to --permission-mode. Omit for Claude Code's own default (it asks
+    # before running tools). bypassPermissions = never ask; the container is
+    # then the only boundary. Valid: default, acceptEdits, auto,
+    # bypassPermissions, manual, dontAsk, plan.
+    #permission_mode: bypassPermissions
     # Allow the Codex desktop app to connect over SSH. Needs no extra process:
     # the app spawns `codex app-server` itself through the login shell.
     codex: true

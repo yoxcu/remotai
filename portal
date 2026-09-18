@@ -68,6 +68,10 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 # same-dir (Claude Code's own default) is ours too.
 SPAWN_MODES = ("same-dir", "worktree", "session")
 DEFAULT_WORKDIR = "/home/dev/projects"
+# `remote-control --permission-mode=<mode>`. It does NOT accept
+# --dangerously-skip-permissions; bypassPermissions is that setting's name here.
+PERMISSION_MODES = ("default", "acceptEdits", "auto", "bypassPermissions",
+                    "manual", "dontAsk", "plan")
 KEY_RE = re.compile(r"^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-ssh-ed25519@\S+|sk-ecdsa-sha2-\S+)\s+\S+")
 
 BANNED_ENV = (
@@ -134,9 +138,14 @@ def load_config(required: bool = True) -> dict:
         user.setdefault("codex", False)
         user.setdefault("spawn", "same-dir")
         user.setdefault("workdir", DEFAULT_WORKDIR)
+        user.setdefault("permission_mode", None)
         if user["spawn"] not in SPAWN_MODES:
             die(f"user '{user['name']}' has spawn: {user['spawn']!r}; "
                 f"valid modes are {', '.join(SPAWN_MODES)}")
+        if user["permission_mode"] and user["permission_mode"] not in PERMISSION_MODES:
+            die(f"user '{user['name']}' has permission_mode: "
+                f"{user['permission_mode']!r}; valid modes are "
+                f"{', '.join(PERMISSION_MODES)}")
         user.setdefault("extra_keys", [])
         if user.get("keys"):
             die(f"user '{user['name']}' still has a 'keys:' block, which no "
@@ -434,6 +443,8 @@ def render(cfg: dict, quiet: bool = False) -> None:
                 "AGENT_CODEX": "1" if user["codex"] else "0",
                 "AGENT_SPAWN": user.get("spawn", "same-dir"),
                 "AGENT_WORKDIR": user.get("workdir", DEFAULT_WORKDIR),
+                # Empty means "do not pass the flag at all".
+                "AGENT_PERMISSION_MODE": user.get("permission_mode") or "",
             },
             "ports": [f"0.0.0.0:{port}:22"],
             "volumes": mounts,
@@ -529,6 +540,13 @@ def cmd_add(args: argparse.Namespace) -> None:
     if claude:
         entry["spawn"] = args.spawn
         entry["workdir"] = args.workdir
+        mode = "bypassPermissions" if args.skip_permissions else args.permission_mode
+        if mode:
+            entry["permission_mode"] = mode
+        if mode == "bypassPermissions":
+            warn("bypassPermissions: this container's agent will run tools without "
+                 "asking. The container is the only thing standing between it and "
+                 "the host, and it has network access and passwordless sudo.")
         if args.spawn == "worktree" and args.workdir == DEFAULT_WORKDIR:
             warn(f"--spawn worktree needs {DEFAULT_WORKDIR} to be a git repository. "
                  "It is not, so the container will fall back to same-dir. Pass "
@@ -732,7 +750,7 @@ def _probe(name: str, state: str, quick: bool) -> dict:
 def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
     host = agent_host(cfg)
     hdr = (f"{'NAME':<14}{'PORT':<7}{'STATE':<11}{'CLAUDE':<10}{'CODEX':<10}"
-           f"{'RC LOOP':<9}{'SPAWN':<10}")
+           f"{'RC LOOP':<9}{'SPAWN':<10}{'PERMS':<18}")
     print(_c("1", hdr))
     rows = []
     for user in users:
@@ -745,8 +763,10 @@ def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
             row["codex"] = "off"
         rows.append((user, row))
         spawn = user.get("spawn", "same-dir") if user["claude"] else "-"
+        perms = (user.get("permission_mode") or "default") if user["claude"] else "-"
         print(f"{name:<14}{user['port']:<7}{row['state']:<11}"
-              f"{row['claude']:<10}{row['codex']:<10}{row['rc']:<9}{spawn:<10}")
+              f"{row['claude']:<10}{row['codex']:<10}{row['rc']:<9}{spawn:<10}"
+              f"{perms:<18}")
     for user, row in rows:
         print(f"  {_c('2', user['name'] + ' keys:   ' + describe_key_sources(user))}")
     for user, row in rows:
@@ -853,6 +873,12 @@ def main() -> None:
     p.add_argument("--spawn", choices=SPAWN_MODES, default="same-dir",
                    help="how Remote Control creates sessions (default: same-dir; "
                         "worktree requires --workdir to be a git repository)")
+    p.add_argument("--skip-permissions", action="store_true",
+                   help="shorthand for --permission-mode bypassPermissions: the "
+                        "agent runs tools without prompting")
+    p.add_argument("--permission-mode", choices=PERMISSION_MODES, default=None,
+                   help="permission mode for Remote Control sessions "
+                        "(default: Claude Code's own)")
     p.add_argument("--workdir", default=DEFAULT_WORKDIR, metavar="DIR",
                    help=f"working directory for the Remote Control server "
                         f"(default: {DEFAULT_WORKDIR})")

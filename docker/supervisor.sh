@@ -50,6 +50,11 @@ AGENT_CLAUDE="${AGENT_CLAUDE:-0}"
 #                     directory to be a git repository.
 # session:            one session, capacity 1, exits when complete.
 AGENT_SPAWN="${AGENT_SPAWN:-same-dir}"
+# Passed through to `--permission-mode=`. Empty means "do not pass the flag",
+# leaving Claude Code's own default. bypassPermissions is the "stop asking me"
+# setting: the agent runs tools without prompting, so the container IS the
+# safety boundary.
+AGENT_PERMISSION_MODE="${AGENT_PERMISSION_MODE:-}"
 AGENT_WORKDIR="${AGENT_WORKDIR:-${PROJECTS}}"
 
 log() { printf '[%s] supervisor: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
@@ -237,7 +242,11 @@ rc_loop() {
     cd "${AGENT_WORKDIR}" || { rc_log "FATAL: ${AGENT_WORKDIR} is missing"; sleep 60; return 1; }
 
     local rc spawn started elapsed delay="${RC_RESTART_DELAY}"
+    local -a perm_args=()
     spawn=$(resolve_spawn)
+    if [ -n "${AGENT_PERMISSION_MODE}" ]; then
+        perm_args=("--permission-mode=${AGENT_PERMISSION_MODE}")
+    fi
     while :; do
         if [ -f "${RC_PAUSE}" ]; then
             rc_log "paused by 'portal setup'; re-checking in ${RC_AUTH_POLL}s"
@@ -257,7 +266,7 @@ rc_loop() {
             continue
         fi
 
-        rc_log "starting: claude remote-control --name ${AGENT_NAME}@${AGENT_HOST} --spawn ${spawn} (cwd=${PWD})"
+        rc_log "starting: claude remote-control --name ${AGENT_NAME}@${AGENT_HOST} --spawn ${spawn} ${perm_args[*]:-} (cwd=${PWD})"
         # stdout/stderr split on purpose: stdout stays attached to the tmux pty
         # so the TUI renders and stays interactive, stderr is captured so a
         # crash leaves a trace in rc.log.
@@ -265,6 +274,7 @@ rc_loop() {
         claude remote-control \
             --name "${AGENT_NAME}@${AGENT_HOST}" \
             --spawn "${spawn}" \
+            "${perm_args[@]}" \
             2>>"${RC_LOG}"
         rc=$?
         elapsed=$(( SECONDS - started ))

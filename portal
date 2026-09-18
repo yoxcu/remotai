@@ -110,7 +110,7 @@ def load_config(required: bool = True) -> dict:
     if not USERS_YAML.exists():
         if required:
             die(f"{USERS_YAML} does not exist. Copy {USERS_YAML_EXAMPLE.name} to "
-                f"users.yaml, or start with: ./portal add <name> --key <pubkey>")
+                f"users.yaml, or start with: ./portal add <name> --claude")
         return {"srv_root": DEFAULT_SRV_ROOT, "users": []}
     with USERS_YAML.open() as fh:
         cfg = yaml.safe_load(fh) or {}
@@ -606,7 +606,7 @@ def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     cfg = load_config()
     if not cfg["users"]:
-        info("no users yet — ./portal add <name> --key <pubkey> --claude")
+        info("no users yet — ./portal add <name> --claude")
         return
     if not image_exists():
         warn(f"{IMAGE} is not built yet — run './portal update'")

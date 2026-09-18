@@ -1,0 +1,144 @@
+# syntax=docker/dockerfile:1
+#
+# agent-base — one image, one work container per person.
+#
+# Deliberately contains NO credentials and NO agent configuration. Everything
+# personal (~/.claude, ~/.codex, ~/.ssh, shell rc) lives in the per-user named
+# volume mounted at /home/dev, so `portal update` can throw this image away and
+# rebuild it without touching a single login.
+FROM ubuntu:24.04
+
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8
+
+# ---------------------------------------------------------------------------
+# 1. Base packages.
+# ---------------------------------------------------------------------------
+# Split from the third-party repos below so a key/repo change does not
+# re-download the whole distro.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        locales \
+        sudo \
+        tini \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 2. Third-party apt repos: NodeSource (Node 22 LTS) and GitHub CLI.
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04's own `gh` is frozen at the release-time version, so use the
+# upstream repo. Keys are dearmored to keyrings and pinned with signed-by
+# rather than piping an installer script into a shell.
+RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list
+
+# ---------------------------------------------------------------------------
+# 3. The toolchain itself.
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nodejs \
+        git \
+        git-lfs \
+        gh \
+        tmux \
+        openssh-server \
+        jq \
+        ripgrep \
+        fd-find \
+        less \
+        vim \
+        nano \
+        rsync \
+        unzip \
+        build-essential \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && git lfs install --system \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 4. The `dev` user.
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04 ships a stock `ubuntu` account already sitting on UID/GID 1000,
+# which collides with the usual host UID. Remove it before creating `dev`.
+RUN userdel -r ubuntu 2>/dev/null || true; \
+    groupdel ubuntu 2>/dev/null || true; \
+    if getent group "${DEV_GID}" >/dev/null; then \
+        groupmod -n dev "$(getent group "${DEV_GID}" | cut -d: -f1)"; \
+    else \
+        groupadd -g "${DEV_GID}" dev; \
+    fi; \
+    useradd -m -u "${DEV_UID}" -g "${DEV_GID}" -s /bin/bash dev; \
+    echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-dev; \
+    chmod 0440 /etc/sudoers.d/90-dev; \
+    passwd -l dev
+
+# ---------------------------------------------------------------------------
+# 5. sshd.
+# ---------------------------------------------------------------------------
+# Two separate PATH mechanisms, because they cover different cases:
+#
+#   /etc/environment     -> applied by sshd through PAM. This is what covers
+#                           `ssh host 'command'`, which bash runs NON-login and
+#                           NON-interactive, reading neither /etc/profile nor
+#                           ~/.bashrc. The Codex desktop app spawns
+#                           `codex app-server` exactly this way.
+#   /etc/profile.d/...   -> login shells (`ssh -t host`, `bash -lc`, tmux).
+#
+# claude and codex are npm globals under the default /usr prefix, so they land
+# in /usr/bin and are on the default PATH regardless; the entries below add the
+# per-user prefixes that survive `portal update` in the home volume.
+RUN rm -f /etc/ssh/ssh_host_*_key* \
+    && mkdir -p /etc/ssh/authorized_keys.d /run/sshd \
+    && sed -i 's/^\(session\s\+required\s\+pam_loginuid\.so\)/#\1/' /etc/pam.d/sshd \
+    && printf '%s\n' \
+        'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        'LANG="en_US.UTF-8"' \
+        > /etc/environment
+COPY sshd_config /etc/ssh/sshd_config
+COPY profile.d-agent.sh /etc/profile.d/10-agent.sh
+RUN chmod 0644 /etc/ssh/sshd_config /etc/profile.d/10-agent.sh
+
+# ---------------------------------------------------------------------------
+# 6. Project toolchain hook — yours to edit.
+# ---------------------------------------------------------------------------
+# Sits above the npm layer on purpose: `portal update` busts only the layer
+# below, so your toolchain stays cached across updates, while editing the hook
+# costs one npm install.
+COPY toolchain.hook.sh /usr/local/lib/toolchain.hook.sh
+RUN chmod 0755 /usr/local/lib/toolchain.hook.sh && /usr/local/lib/toolchain.hook.sh
+
+# ---------------------------------------------------------------------------
+# 7. The agents.
+# ---------------------------------------------------------------------------
+# REFRESH is bumped by `portal update` to force a fresh pull of both CLIs.
+ARG REFRESH=0
+RUN echo "refresh=${REFRESH}" \
+    && npm install -g --no-fund --no-audit \
+        @anthropic-ai/claude-code \
+        @openai/codex \
+    && npm cache clean --force \
+    && claude --version \
+    && codex --version
+
+COPY supervisor.sh /usr/local/bin/supervisor.sh
+RUN chmod 0755 /usr/local/bin/supervisor.sh
+
+EXPOSE 22
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/supervisor.sh"]

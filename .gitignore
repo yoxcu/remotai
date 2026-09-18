@@ -1,0 +1,6 @@
+# Site-local state — never commit
+users.yaml
+compose.users.yml
+*.pem
+id_ed25519*
+.smoke/

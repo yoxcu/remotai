@@ -116,7 +116,12 @@ It walks through, in order:
      `~/.codex/auth.json` from a machine where she is already signed in. It
      carries the refresh token so it keeps working, but it ties the container to
      that same install.
-5. Restarting the container so the supervised loop takes over.
+5. Codex pairing: it brings the app-server daemon up with remote control
+   enabled and prints a short-lived code for Alice's phone. Her phone may well
+   have picked the container up already — it enrolls under the account she just
+   signed in as — so this is the manual fallback, and it is repeatable any time
+   with `./portal pair alice`.
+6. Restarting the container so the supervised loops take over.
 
 While setup runs, `portal` drops `/home/dev/.rc-paused` so the background loop
 does not fight it for the same directory. It is removed afterwards even if you
@@ -128,13 +133,72 @@ in.
 ### Checking on things
 
 ```sh
-./portal status        # container state + both logins + the rc loop
+./portal status        # container state + both logins + both remote controls
 ./portal status -q     # skip the in-container probes (instant)
 ```
 
-`NO LOGIN` under CLAUDE means the remote-control loop is idling and waiting —
-rerun `portal setup`. The last line of each user's `~/rc.log` is printed below
-the table.
+| Column | What it is |
+|---|---|
+| `CLAUDE` | the claude.ai login, by auth method. `NO LOGIN` means the loop is idling — rerun `portal setup`. |
+| `LOOP` | the tmux session holding `claude remote-control`. |
+| `CODEX` | the ChatGPT login. |
+| `DAEMON` | the Codex app-server daemon. `up` = running with remote control on; `no-rc` = running but not reachable from a phone; `down` = not running. |
+| `SANDBOX` | the Codex `sandbox_mode`, or `default` for Codex's own. |
+
+The last line of each user's `~/rc.log` and `~/codex.log` is printed below the
+table. `status` only ever reads — it asks the Codex daemon its version rather
+than running `remote-control start`, so checking never starts anything.
+
+---
+
+## Codex on a phone
+
+`codex: true` gets a user two things off one login: the desktop app over SSH, as
+before, and a supervised `codex remote-control` daemon so the container turns up
+in the Codex phone app. Nothing is exposed inbound either way — the daemon dials
+out.
+
+```sh
+./portal pair alice     # short-lived pairing code, repeatable
+```
+
+The daemon enrolls under whichever ChatGPT account the container is signed in
+as, so a phone on that same account often lists the container without pairing at
+all. `portal pair` is the manual route.
+
+Codex names the device after the container's **hostname**, which is the user
+name. There is no `--name` flag, so unlike Claude there is no
+`alice@agents.example.com` form — the phone just says `alice`. If you run more
+than one agent host, give containers distinct names across them.
+
+### Where the Codex binary lives, and why it is not npm
+
+`codex remote-control`, and every `codex app-server daemon` subcommand, refuses
+to run against the npm package:
+
+```
+Error: managed standalone Codex install not found at
+       $CODEX_HOME/packages/standalone/current/codex
+This command requires the standalone install managed by the Codex installer,
+because the daemon starts and updates app-server from that fixed path.
+```
+
+`$CODEX_HOME` is `~/.codex` — a **per-user volume** here. Installing it there
+would put ~350MB in every volume and hand each container an auto-updater that
+moves Codex whenever it likes, behind `portal update`'s back.
+
+So the image installs it once, at `/opt/codex/packages/standalone`, root-owned
+and read-only, and `supervisor.sh` symlinks each user's
+`~/.codex/packages/standalone` at it on boot. The daemon runs fine from a
+read-only tree; only the auto-updater wants to write, and moving versions is
+`portal update`'s job. One consequence worth knowing: `codex` is now
+`/usr/local/bin/codex`, not `/usr/bin/codex`.
+
+If someone runs the upstream installer inside their own container by hand, that
+real directory wins and `supervisor.sh` leaves it alone — but it says so in
+`~/codex.log`, because that container will then drift off the pinned version.
+`rm -rf ~/.codex/packages/standalone` and a restart adopts the shared copy
+again.
 
 ---
 
@@ -145,7 +209,8 @@ the table.
 ```
 
 Rebuilds `agent-base:latest` with a fresh `npm install -g` of
-`@anthropic-ai/claude-code` and `@openai/codex`, then recreates every container.
+`@anthropic-ai/claude-code` and a fresh run of the Codex standalone installer,
+then recreates every container. Both agent layers move together.
 
 **Nothing is lost.** Each `<name>-home` named volume is reattached to the new
 container, so logins, `~/.claude`, `~/.codex`, `~/.ssh`, shell history and the
@@ -157,8 +222,12 @@ belong in `docker/toolchain.hook.sh`, which is rebuilt into the image. That hook
 sits above the npm layer, so `portal update` re-pulls the agents without
 re-running your toolchain, and editing the hook costs one npm install.
 
-`--no-pull` rebuilds without forcing fresh agent packages, if you want to change
+`--no-pull` rebuilds without forcing fresh agent downloads, if you want to change
 the image without moving versions.
+
+Because Codex lives in the image rather than in anyone's volume, `portal update`
+moves every container to the same Codex at once — there is no per-container
+drift to chase.
 
 Do this on a weekday morning, not mid-sprint: recreating a container interrupts
 whatever sessions were running. They come back, but the work in flight does not.
@@ -220,6 +289,80 @@ you have mounted anything sensitive into `/srv/agents`.
 
 `remote-control` also accepts `--sandbox`, which is a separate hardening knob
 and not currently wired through `portal`. Ask if you want it.
+
+---
+
+## Codex sandbox mode
+
+The Codex counterpart of `permission_mode`, and it has the same scope: it
+configures the **supervised remote-control daemon** — the sessions that come
+from someone's phone — not a `codex` they run by hand over SSH.
+
+```sh
+./portal add alice --codex --sandbox-mode danger-full-access
+```
+
+Or `sandbox_mode:` in `users.yaml` for an existing user, then `./portal update`.
+Valid modes: `read-only`, `workspace-write`, `danger-full-access`. Omitting it
+passes nothing, leaving Codex's own default — `workspace-write` with approval
+`OnRequest`.
+
+`supervisor.sh` passes it as `-c sandbox_mode="<mode>"` on
+`codex remote-control start`, and logs the full command in `~/codex.log` at
+boot, so you can see what the daemon was actually given rather than inferring it
+from environment variables:
+
+```
+starting: codex remote-control start -c 'sandbox_mode="danger-full-access"' (sandbox_mode=danger-full-access)
+```
+
+`portal pair` passes the same flag, so a pairing that happens to find the daemon
+down does not start one configured differently from every daemon the supervisor
+starts.
+
+### Whether the sandbox works here at all
+
+Codex's Linux sandbox is bubblewrap-based, and bubblewrap needs unprivileged
+user namespaces. Docker's default seccomp and AppArmor confinement denies those
+inside a container — **even when the host allows them**, which is the confusing
+part. Check your own containers:
+
+```sh
+docker exec -u dev work-alice codex sandbox -- sh -c 'echo ok'
+```
+
+- prints `ok` → the sandbox engages, and there is nothing to configure.
+- prints `bwrap: No permissions to create a new namespace…` → it cannot work
+  here. It does not degrade to running unsandboxed; it fails.
+
+If it fails, confirm what that means for real sessions, which take a different
+code path from that subcommand:
+
+```sh
+docker exec -it work-alice su -l dev -c "codex exec 'Run the shell command: echo PROBE'"
+```
+
+If that fails the same way, every shell command from a phone will, and
+`sandbox_mode: danger-full-access` is what makes the container usable.
+
+### Why `danger-full-access` is usually the honest answer here
+
+The name is alarming and the trade is not. Three things are already true of
+these containers:
+
+- everyone in one has **passwordless sudo**;
+- Claude runs with `bypassPermissions` wherever you have set it;
+- this guide already says, above, that the container is the security boundary.
+
+An inner Codex sandbox on top of that prevents accidents, not a determined
+agent. And the alternative — `security_opt: [apparmor=unconfined]` or
+`seccomp=unconfined` on the containers, so bubblewrap can nest — buys the inner
+sandbox by weakening the outer one you actually rely on. That is a bad trade.
+Flipping the host sysctl is worse still: it affects every container and every
+process on the box.
+
+So: if the check above fails, set `sandbox_mode: danger-full-access` and treat
+the container as the boundary, which is what it already was.
 
 ---
 
@@ -402,7 +545,8 @@ The Codex desktop app follows `ProxyJump` fine.
 | `compose.users.yml` | generated; never edit |
 | `docker/Dockerfile.agent-base` | the shared image |
 | `docker/toolchain.hook.sh` | **yours** — project toolchains |
-| `docker/supervisor.sh` | sshd + the remote-control loop |
+| `docker/supervisor.sh` | sshd + both remote-control loops |
+| `/opt/codex/packages/standalone` | Codex, in the image; every `~/.codex/packages/standalone` links here |
 | `docker/sshd_config` | key-only sshd |
 | `/srv/agents/<name>/projects` | bind-mounted to `~/projects` |
 | `/home/<name>/.ssh/authorized_keys` | the host account's keys, mounted read-only |
@@ -431,16 +575,25 @@ environment variable it had to strip.
 | Session appears as `dev@<container-name>` | Pre-fix container: the AGENT_* vars were lost across `su -l`. Rebuild with `./portal update`. |
 | `permission_mode` set but sessions still prompt | Check the `remote control:` line in `docker logs`, and the `starting:` line in `rc.log`, for `--permission-mode=`. Env vars alone do not prove it arrived. |
 | `Worktree mode requires a git repository` in rc.log | `spawn: worktree` with a `workdir` that is not a repo. Set `spawn: same-dir`, or point `workdir` at a repo. Newer containers fall back automatically and say so. |
-| Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/bin/codex` |
+| Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/local/bin/codex` |
+| Container missing from the Codex phone app | `./portal status` — `DAEMON` should be `up`. Then `docker exec -it work-alice su -l dev -c 'tail -40 ~/codex.log'`; it logs every state change of the daemon. `./portal pair alice` for a fresh code. |
+| `managed standalone Codex install not found` | The image predates the standalone install, or `~/.codex/packages/standalone` is not linked. `./portal update`, then check `~/codex.log` for the `linked …` line. |
+| `bwrap: No permissions to create a new namespace` in a session | Codex's sandbox cannot run inside these containers. See "Codex sandbox mode" — usually `sandbox_mode: danger-full-access`. |
+| `sandbox_mode` set but sessions behave the same | Check the `starting:` line in `~/codex.log` for the `-c sandbox_mode=` argument. If it is right, the daemon predates it: `remote-control start` reports `alreadyRunning` and does not re-read config. `codex app-server daemon restart` in the container, or `./portal update`, which recreates it. |
+| Codex version differs between containers | Somebody ran the upstream installer by hand inside one. `~/codex.log` says so. `rm -rf ~/.codex/packages/standalone` and restart to go back to the image's copy. |
 | `codex login --device-auth` refused by the workspace | Use the SSH tunnel: `ssh -L 1455:localhost:1455 -p 22NN dev@host`, then `codex login` in that session. |
 | Host key changed for everyone after an update | Should not happen — keys live in the home volume. If it did, the volume was recreated. |
 | Container restart-looping | `docker logs work-alice`; a corrupt home volume is the usual cause. |
 
 Never put `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `ANTHROPIC_BASE_URL`, `DISABLE_TELEMETRY`, `DO_NOT_TRACK`,
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_GROWTHBOOK` in a compose
-file, the Dockerfile, or a `settings.json`. Remote Control needs the claude.ai
-account login; any of these routes Claude Code elsewhere and sessions stop
-appearing. `portal` strips them from its own environment and `supervisor.sh`
-strips them at container boot, but neither can help if they are baked into a
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_GROWTHBOOK`,
+`CODEX_API_KEY`, `OPENAI_API_KEY` or `CODEX_HOME` in a compose file, the
+Dockerfile, or a `settings.json`. Both remote controls need the account login —
+Codex says so outright, "remote control requires ChatGPT authentication; API key
+auth is not supported" — and any of these routes the CLI elsewhere. `CODEX_HOME`
+is in the list for a different reason: moving it moves the standalone install
+the container links into `~/.codex`, and the daemon stops finding it. `portal`
+strips the credential ones from its own environment and `supervisor.sh` strips
+all of them at container boot, but neither can help if they are baked into a
 config file.

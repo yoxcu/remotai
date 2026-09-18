@@ -15,6 +15,8 @@
 #   * adding a key on the host reaches the container without a restart
 #   * an extra_keys entry in users.yaml also gets in
 #   * no banned auth/telemetry variable leaks into the container
+#   * the Codex standalone install is shared from the image and linked into
+#     the user's ~/.codex, which is what `codex remote-control` insists on
 #   * the supervisor restarts the remote-control loop when it is killed,
 #     and restarts sshd when that is killed
 #
@@ -154,12 +156,23 @@ check_out "claude is installed in the image" '^[0-9]+\.[0-9]+' \
     docker run --rm --entrypoint claude agent-base:latest --version
 check_out "codex is installed in the image" 'codex-cli' \
     docker run --rm --entrypoint codex agent-base:latest --version
+# `codex remote-control` refuses to run without this exact layout, and the
+# image is where it lives so one copy serves every container.
+check "the shared standalone codex is in the image" 0 \
+    docker run --rm --entrypoint test agent-base:latest \
+        -x /opt/codex/packages/standalone/current/bin/codex
+check_out "the codex on PATH is that same install" \
+    '^/opt/codex/packages/standalone/' \
+    docker run --rm --entrypoint readlink agent-base:latest -f /usr/local/bin/codex
 check_out "dev user exists with the build uid" '^uid=' \
     docker run --rm --entrypoint id agent-base:latest dev
 
 say "2. portal add ${USER_NAME}"
+# --sandbox-mode is set so the check below can follow it all the way through:
+# users.yaml -> compose env -> /run/agent.env -> the daemon's command line.
 if ./portal add "${USER_NAME}" --authorized-keys "${HOST_AKEYS}" \
-        --key "${KEY}3.pub" --claude --codex --port "${PORT}"; then
+        --key "${KEY}3.pub" --claude --codex --port "${PORT}" \
+        --sandbox-mode danger-full-access; then
     ok "portal add"
 else
     bad "portal add"; exit "${FAIL}"
@@ -201,18 +214,18 @@ check_out "both key sources are merged" 'smoke-test-extra' \
 say "5. PATH — the check the Codex desktop app depends on"
 # `ssh host 'cmd'` runs bash NON-login and NON-interactive: it reads neither
 # /etc/profile nor ~/.bashrc. This is exactly how the app spawns app-server.
-check_out "codex on PATH for a non-login ssh command" '^/usr/bin/codex$' \
+check_out "codex on PATH for a non-login ssh command" '^/usr/local/bin/codex$' \
     ssh_cmd 'command -v codex'
 check_out "claude on PATH for a non-login ssh command" '^/usr/bin/claude$' \
     ssh_cmd 'command -v claude'
-check_out "codex on PATH in a login shell" '^/usr/bin/codex$' \
+check_out "codex on PATH in a login shell" '^/usr/local/bin/codex$' \
     ssh_cmd 'bash -lc "command -v codex"'
 check_out "claude on PATH in a login shell" '^/usr/bin/claude$' \
     ssh_cmd 'bash -lc "command -v claude"'
 check_out "codex actually runs over ssh" 'codex-cli' ssh_cmd 'codex --version'
 
 say "6. environment hygiene"
-if out=$(ssh_cmd 'env' | grep -E '^(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_BASE_URL|DISABLE_TELEMETRY|DO_NOT_TRACK|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|DISABLE_GROWTHBOOK)='); then
+if out=$(ssh_cmd 'env' | grep -E '^(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_BASE_URL|DISABLE_TELEMETRY|DO_NOT_TRACK|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|DISABLE_GROWTHBOOK|CODEX_API_KEY|OPENAI_API_KEY|CODEX_HOME)='); then
     bad "no banned auth/telemetry variables in the container"
     note "${out}"
 else
@@ -234,6 +247,39 @@ check_out "loop runs in /home/dev/projects" '/home/dev/projects' \
     ssh_cmd 'tmux display-message -p -t rc "#{pane_current_path}"'
 check_out "rc.log records the loop waiting for a login" 'portal setup' \
     ssh_cmd 'cat ~/rc.log'
+
+say "7b. the codex remote-control daemon"
+# Same deal as the claude loop: the throwaway user is not signed in, so the
+# poll loop parks in its "not signed in" branch. What this proves is the part
+# that is easy to get wrong — that the volume's ~/.codex points at the image's
+# standalone install, which is the only thing `codex remote-control` accepts.
+check_out "the volume's codex standalone links into the image" \
+    '^/opt/codex/packages/standalone$' \
+    ssh_cmd 'readlink -f ~/.codex/packages/standalone'
+check "the shared standalone install is read-only" 1 \
+    ssh_cmd 'touch ~/.codex/packages/standalone/.smoke'
+# The daemon is not running (nobody is signed in), so `daemon version` failing
+# to reach its socket is the expected answer. What must NOT come back is the
+# refusal that means the standalone layout is missing — that is the failure
+# this whole arrangement exists to prevent.
+out=$(ssh_cmd 'codex app-server daemon version 2>&1')
+if printf '%s' "${out}" | grep -q 'standalone Codex install not found'; then
+    bad "codex finds the standalone install it demands"
+    note "${out%%$'\n'*}"
+else
+    ok "codex finds the standalone install it demands"
+fi
+if wait_for 90 ssh_cmd 'grep -q "portal setup" ~/codex.log'; then
+    ok "codex.log records the loop waiting for a login"
+else
+    bad "codex.log records the loop waiting for a login"
+    note "$(ssh_cmd 'cat ~/codex.log' 2>&1 | tail -3 | tr '\n' '|')"
+fi
+# The env-var half of this is easy and proves nothing. What matters is that the
+# value reached the command line, across the `su -l` that throws AGENT_* away.
+check_out "sandbox_mode reaches the daemon command line" \
+    'sandbox_mode=.danger-full-access.' \
+    ssh_cmd 'cat ~/codex.log'
 
 say "8. supervisor restarts what dies"
 before=$(ssh_cmd 'wc -l < ~/rc.log' 2>/dev/null | tr -d ' \r')

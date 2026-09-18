@@ -13,6 +13,10 @@ services:
       AGENT_HOST: agents.example.com
       AGENT_CLAUDE: '1'
       AGENT_CODEX: '1'
+      AGENT_SPAWN: worktree
+      AGENT_WORKDIR: /home/dev/projects/monorepo
+      AGENT_PERMISSION_MODE: bypassPermissions
+      AGENT_SANDBOX_MODE: danger-full-access
     ports:
     - 0.0.0.0:2201:22
     volumes:
@@ -36,6 +40,10 @@ services:
       AGENT_HOST: agents.example.com
       AGENT_CLAUDE: '0'
       AGENT_CODEX: '1'
+      AGENT_SPAWN: same-dir
+      AGENT_WORKDIR: /home/dev/projects
+      AGENT_PERMISSION_MODE: ''
+      AGENT_SANDBOX_MODE: read-only
     ports:
     - 0.0.0.0:2203:22
     volumes:

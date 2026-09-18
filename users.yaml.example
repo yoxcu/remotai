@@ -48,8 +48,24 @@ users:
     # then the only boundary. Valid: default, acceptEdits, auto,
     # bypassPermissions, manual, dontAsk, plan.
     #permission_mode: bypassPermissions
-    # Allow the Codex desktop app to connect over SSH. Needs no extra process:
-    # the app spawns `codex app-server` itself through the login shell.
+    # Sandbox for Codex remote-control sessions, passed to the daemon as
+    # `-c sandbox_mode="<mode>"`. Omit for Codex's own default
+    # (workspace-write, approval OnRequest). Valid: read-only,
+    # workspace-write, danger-full-access.
+    #
+    # Codex's Linux sandbox uses bubblewrap, and bubblewrap needs unprivileged
+    # user namespaces — which Docker's default seccomp/AppArmor confinement
+    # denies inside a container. If that is true on your host, the sandbox
+    # cannot work here at all and sessions fail rather than degrade; see
+    # "Codex sandbox mode" in docs/ADMIN.md for the one-command check.
+    #sandbox_mode: danger-full-access
+    # Codex. Two things at once, because they share one login:
+    #   * the desktop app over SSH — needs no process here, the app spawns
+    #     `codex app-server` itself through the login shell;
+    #   * a supervised `codex remote-control` daemon, so the Codex phone app can
+    #     reach this container. Pair a phone with `./portal pair <name>`.
+    # Codex names the device after the container hostname, which is this
+    # `name:` — there is no "<name>@<host>" form the way Claude has.
     codex: true
     # Resolved by `portal add` from the matching host account. Point it
     # somewhere else if the container name and the host account differ.

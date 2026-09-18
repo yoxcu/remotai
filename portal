@@ -13,6 +13,7 @@ Either may be omitted, but not both.
     ./portal build              build agent-base:latest
     ./portal add <name> [--key <pubkey|path>]... [--claude] [--codex]
     ./portal setup <name>       one-time interactive logins (needs a TTY)
+    ./portal pair <name>        fresh Codex pairing code for a phone
     ./portal status [-q]
     ./portal update             rebuild the image, recreate containers
     ./portal rm <name> [--purge]
@@ -72,12 +73,23 @@ DEFAULT_WORKDIR = "/home/dev/projects"
 # --dangerously-skip-permissions; bypassPermissions is that setting's name here.
 PERMISSION_MODES = ("default", "acceptEdits", "auto", "bypassPermissions",
                     "manual", "dontAsk", "plan")
+# Codex's `sandbox_mode`, passed to the daemon as `-c sandbox_mode="<mode>"`.
+# Omitting it leaves Codex's own default, which is workspace-write with
+# approval OnRequest. danger-full-access turns the inner sandbox off entirely —
+# see "Codex sandbox mode" in docs/ADMIN.md for when that is the right answer
+# here, which is more often than the name suggests.
+SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 KEY_RE = re.compile(r"^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-ssh-ed25519@\S+|sk-ecdsa-sha2-\S+)\s+\S+")
 
+# Both remote controls insist on an account login — Codex says so outright:
+# "remote control requires ChatGPT authentication; API key auth is not
+# supported". Any of these reaching a container sends the CLI down an API-key or
+# self-hosted path instead.
 BANNED_ENV = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_BASE_URL", "DISABLE_TELEMETRY", "DO_NOT_TRACK",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_GROWTHBOOK",
+    "CODEX_API_KEY", "OPENAI_API_KEY",
 )
 
 
@@ -139,6 +151,7 @@ def load_config(required: bool = True) -> dict:
         user.setdefault("spawn", "same-dir")
         user.setdefault("workdir", DEFAULT_WORKDIR)
         user.setdefault("permission_mode", None)
+        user.setdefault("sandbox_mode", None)
         if user["spawn"] not in SPAWN_MODES:
             die(f"user '{user['name']}' has spawn: {user['spawn']!r}; "
                 f"valid modes are {', '.join(SPAWN_MODES)}")
@@ -146,6 +159,10 @@ def load_config(required: bool = True) -> dict:
             die(f"user '{user['name']}' has permission_mode: "
                 f"{user['permission_mode']!r}; valid modes are "
                 f"{', '.join(PERMISSION_MODES)}")
+        if user["sandbox_mode"] and user["sandbox_mode"] not in SANDBOX_MODES:
+            die(f"user '{user['name']}' has sandbox_mode: "
+                f"{user['sandbox_mode']!r}; valid modes are "
+                f"{', '.join(SANDBOX_MODES)}")
         user.setdefault("extra_keys", [])
         if user.get("keys"):
             die(f"user '{user['name']}' still has a 'keys:' block, which no "
@@ -445,6 +462,7 @@ def render(cfg: dict, quiet: bool = False) -> None:
                 "AGENT_WORKDIR": user.get("workdir", DEFAULT_WORKDIR),
                 # Empty means "do not pass the flag at all".
                 "AGENT_PERMISSION_MODE": user.get("permission_mode") or "",
+                "AGENT_SANDBOX_MODE": user.get("sandbox_mode") or "",
             },
             "ports": [f"0.0.0.0:{port}:22"],
             "volumes": mounts,
@@ -479,8 +497,9 @@ def build_image(cfg: dict, refresh: bool) -> None:
     env = {k: v for k, v in os.environ.items() if k not in BANNED_ENV}
     env["DEV_UID"] = str(uid)
     env["DEV_GID"] = str(gid)
-    # Busting REFRESH invalidates only the npm layer, so claude and codex come
-    # down fresh while the apt layers and your toolchain hook stay cached.
+    # Busting REFRESH invalidates only the two agent layers, so claude (npm) and
+    # codex (the standalone installer) come down fresh while the apt layers and
+    # your toolchain hook stay cached.
     env["REFRESH"] = str(int(time.time())) if refresh else "0"
     info(f"building {IMAGE} (uid={uid} gid={gid}"
          + (f", REFRESH={env['REFRESH']}" if refresh else "") + ")")
@@ -537,6 +556,14 @@ def cmd_add(args: argparse.Namespace) -> None:
              f"Edit {USERS_YAML.name} and run './portal update' to change that.")
 
     entry = {"name": name, "port": port, "claude": claude, "codex": codex}
+    if codex and args.sandbox_mode:
+        entry["sandbox_mode"] = args.sandbox_mode
+        if args.sandbox_mode == "danger-full-access":
+            warn("danger-full-access: Codex sessions from the phone get no inner "
+                 "sandbox. On this host that is usually the honest setting — the "
+                 "container is the boundary — but be sure you meant it.")
+    elif args.sandbox_mode and not codex:
+        warn("--sandbox-mode does nothing without --codex; ignoring it")
     if claude:
         entry["spawn"] = args.spawn
         entry["workdir"] = args.workdir
@@ -574,6 +601,7 @@ def cmd_add(args: argparse.Namespace) -> None:
         print(f"     2. one-time logins: ./portal setup {name}")
     if codex:
         print(f"     3. send them docs/USER-CODEX.md (port {port})")
+        print(f"        a phone pairs with: ./portal pair {name}")
     if claude:
         print("     4. send them docs/USER-CLAUDE.md")
 
@@ -598,7 +626,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
     if user["claude"]:
         steps += ["claude auth login", "accept workspace trust", "enable remote control"]
     if user["codex"]:
-        steps += ["codex login"]
+        steps += ["codex login", "pair the Codex mobile app"]
     if not steps:
         die(f"user '{name}' has neither claude nor codex enabled in {USERS_YAML.name}")
     total = len(steps) + 1
@@ -640,30 +668,47 @@ def cmd_setup(args: argparse.Namespace) -> None:
         if user["codex"]:
             n += 1
             _step(n, total, "codex login")
-            codex_login(cfg, user)
+            signed_in = codex_login(cfg, user)
+
+            n += 1
+            _step(n, total, "pair the Codex mobile app")
+            if signed_in:
+                codex_pair(cfg, user)
+            else:
+                warn(f"no Codex login yet, so there is nothing to pair with. "
+                     f"Run './portal pair {name}' once that is sorted.")
     finally:
         exec_in(name, "rm -f /home/dev/.rc-paused")
 
     n += 1
     _step(n, total, "restart the container")
     compose(cfg, ["up", "-d", "--force-recreate", f"work-{name}"])
-    info("waiting for the remote-control loop to come up …")
+    # The Claude loop announces itself with a tmux session; the Codex daemon has
+    # nothing to hold open, so its first poll is the thing to wait for.
+    probe = ("tmux has-session -t rc" if user["claude"]
+             else "codex app-server daemon version")
+    info("waiting for the supervised loop to come up …")
     for _ in range(20):
         time.sleep(2)
-        if exec_in(name, "tmux has-session -t rc").returncode == 0:
+        if exec_in(name, probe).returncode == 0:
             break
     print()
     _print_status_rows(cfg, [user], quick=False)
     print()
-    print("Attach to the live session any time with:")
-    print(f"     ssh -p {user['port']} dev@{agent_host(cfg)} -t 'tmux attach -t rc'")
+    if user["claude"]:
+        print("Attach to the live Claude session any time with:")
+        print(f"     ssh -p {user['port']} dev@{agent_host(cfg)} -t 'tmux attach -t rc'")
+    if user["codex"]:
+        print(f"Pair another phone any time with:  ./portal pair {name}")
 
 
 CODEX_LOGIN_PORT = 1455
 
 
-def codex_login(cfg: dict, user: dict) -> None:
+def codex_login(cfg: dict, user: dict) -> bool:
     """Walk through whichever Codex login flow this workspace still allows.
+
+    Returns True if the container ends up signed in.
 
     `codex login` runs a local OAuth callback server on localhost:1455 and
     expects a browser on the same machine. In a container neither is true, so
@@ -692,7 +737,7 @@ def codex_login(cfg: dict, user: dict) -> None:
         exec_in(name, "cd /home/dev/projects && codex login --device-auth", tty=True)
     elif choice == "3":
         warn(f"skipped; rerun './portal setup {name}' when ready")
-        return
+        return False
     else:
         print()
         print("On YOUR machine (not this server), in a second terminal:\n")
@@ -711,7 +756,7 @@ def codex_login(cfg: dict, user: dict) -> None:
     status = exec_in(name, "codex login status")
     if status.returncode == 0:
         info("codex signed in")
-        return
+        return True
 
     warn("codex still reports no login:\n       "
          + (status.stdout or status.stderr).strip().replace("\n", "\n       "))
@@ -723,57 +768,200 @@ def codex_login(cfg: dict, user: dict) -> None:
     print()
     print("That carries the refresh token, so it keeps working — but it ties this\n"
           "container to the same account as your laptop's Codex. Prefer the tunnel.")
+    return False
 
 
-def _probe(name: str, state: str, quick: bool) -> dict:
-    row = {"state": state, "claude": "-", "codex": "-", "rc": "-", "last": ""}
+# ---------------------------------------------------------------------------
+# codex remote control (the mobile app)
+# ---------------------------------------------------------------------------
+# Enrollment lands a beat after the daemon does, and `pair` answers "remote
+# control pairing is unavailable until enrollment completes" until it has.
+CODEX_PAIR_TRIES = 6
+CODEX_PAIR_WAIT = 3
+
+
+def codex_rc_start(user: dict) -> tuple[str | None, str]:
+    """Bring up the app-server daemon with remote control enabled.
+
+    Idempotent — it reports `alreadyRunning` rather than starting a second one —
+    and it re-enables remote control on a daemon that has it switched off, so it
+    is the only command needed to get a container back on the air. Returns
+    (status, raw output); status is None if it did not come up.
+
+    It passes the same `-c sandbox_mode=` the supervisor does. If it did not,
+    a `portal pair` that happened to find the daemon down would start one
+    configured differently from every daemon the supervisor starts.
+    """
+    name = user["name"]
+    cfg_arg = ""
+    if user.get("sandbox_mode"):
+        cfg_arg = f" -c 'sandbox_mode=\"{user['sandbox_mode']}\"'"
+    res = exec_in(name, f"codex remote-control start{cfg_arg} --json 2>&1")
+    out = (res.stdout or res.stderr or "").strip()
+    # Usually the whole of stdout is the object. Scan for it anyway rather than
+    # trusting that nothing ever prints a line above it.
+    for text in [out] + [ln for ln in out.splitlines() if ln.startswith("{")]:
+        try:
+            return json.loads(text).get("status"), out
+        except (ValueError, AttributeError):
+            continue
+    return None, out
+
+
+def codex_pair(cfg: dict, user: dict) -> bool:
+    """Print a short-lived pairing code for the Codex app on someone's phone."""
+    name = user["name"]
+    print("The daemon in this container enrolls with the ChatGPT account it is signed\n"
+          "in as, and a phone signed into that same account can often just pick it up.\n"
+          "This is the manual route, for when it does not.\n")
+
+    status, out = codex_rc_start(user)
+    if status is None:
+        warn("`codex remote-control start` did not come up:\n       "
+             + out.replace("\n", "\n       "))
+        print(f"\nSort the login out first, then: ./portal pair {name}")
+        return False
+    info(f"app-server daemon up; remote control is {status}")
+
+    out = ""
+    for _ in range(CODEX_PAIR_TRIES):
+        res = exec_in(name, "codex remote-control pair 2>&1")
+        out = (res.stdout or res.stderr or "").strip()
+        if out and not out.lower().startswith("error"):
+            print()
+            print(_c("1;32", out))
+            print()
+            print("On the phone: open Codex signed in with the SAME ChatGPT account and\n"
+                  "add this computer with that code. It is short-lived — if it expires,\n"
+                  f"./portal pair {name} prints a fresh one.\n")
+            print(f"The device appears as {_c('1', name)} — Codex names it after the "
+                  "container's\nhostname and takes no --name flag, so there is no "
+                  f"'{name}@{agent_host(cfg)}'\nform the way Claude has.")
+            return True
+        time.sleep(CODEX_PAIR_WAIT)
+
+    warn("no pairing code came back:\n       " + out.replace("\n", "\n       "))
+    print(f"\nEnrollment can lag the login by a while. Check './portal status' — "
+          f"DAEMON\nshould read 'up' — and the container's ~/codex.log, then try "
+          f"./portal pair {name}\nagain.")
+    return False
+
+
+def cmd_pair(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    user = find_user(cfg, args.name)
+    name = user["name"]
+    if not user["codex"]:
+        die(f"user '{name}' has codex: false in {USERS_YAML.name} — there is no "
+            f"Codex daemon to pair with. Set it, then './portal update'.")
+    state = container_state(name)
+    if state != "running":
+        die(f"work-{name} is not running (state: {state}). "
+            f"Try './portal update' first.")
+    if exec_in(name, "codex login status").returncode != 0:
+        die(f"work-{name} is not signed in to Codex — './portal setup {name}' first")
+    if not codex_pair(cfg, user):
+        sys.exit(1)
+
+
+def _codex_daemon(name: str) -> str:
+    """Read-only view of the Codex app-server daemon.
+
+    Deliberately not `remote-control start`: that would START a daemon as a side
+    effect of being asked whether one is running, which is not what `status`
+    should do. `daemon version` only talks to an existing control socket.
+    """
+    res = exec_in(name, "codex app-server daemon version 2>/dev/null")
+    try:
+        running = json.loads((res.stdout or "").strip()).get("status") == "running"
+    except (ValueError, TypeError):
+        running = False
+    if not running:
+        return "down"
+    # A daemon can be up for the desktop app while remote control is off, and
+    # then no phone can see it — worth telling those two apart.
+    res = exec_in(name, "cat ~/.codex/app-server-daemon/settings.json 2>/dev/null")
+    try:
+        enabled = json.loads((res.stdout or "").strip()).get("remoteControlEnabled")
+    except (ValueError, TypeError):
+        enabled = False
+    return "up" if enabled else "no-rc"
+
+
+def _probe(user: dict, state: str, quick: bool) -> dict:
+    """One row of `portal status`.
+
+    Only the agents a user actually has are probed: every probe is a `docker
+    exec` into a login shell, and asking a Claude-only container about its Codex
+    daemon costs exactly as much as asking a real one.
+    """
+    name = user["name"]
+    row = {"state": state, "claude": "-", "codex": "-", "rc": "-", "cx": "-",
+           "last": "", "codex_last": ""}
+    if not user["claude"]:
+        row["claude"] = row["rc"] = "off"
+    if not user["codex"]:
+        row["codex"] = row["cx"] = "off"
     if quick or state != "running":
         return row
-    # `claude auth status` exits non-zero when logged out and otherwise prints
-    # JSON. Show authMethod rather than a bare "ok": an API-key login reports
-    # itself as logged in but Remote Control will never work with it.
-    res = exec_in(name, "claude auth status")
-    if res.returncode != 0:
-        row["claude"] = "NO LOGIN"
-    else:
-        try:
-            row["claude"] = (json.loads(res.stdout).get("authMethod") or "ok")[:9]
-        except (ValueError, TypeError):
-            row["claude"] = "ok"
-    row["codex"] = "ok" if exec_in(name, "codex login status").returncode == 0 else "NO LOGIN"
-    row["rc"] = "up" if exec_in(name, "tmux has-session -t rc").returncode == 0 else "down"
-    tail = exec_in(name, "tail -n 1 /home/dev/rc.log 2>/dev/null")
-    row["last"] = tail.stdout.strip()[:88]
+
+    if user["claude"]:
+        # `claude auth status` exits non-zero when logged out and otherwise
+        # prints JSON. Show authMethod rather than a bare "ok": an API-key login
+        # reports itself as logged in but Remote Control will never work with it.
+        res = exec_in(name, "claude auth status")
+        if res.returncode != 0:
+            row["claude"] = "NO LOGIN"
+        else:
+            try:
+                row["claude"] = (json.loads(res.stdout).get("authMethod") or "ok")[:9]
+            except (ValueError, TypeError):
+                row["claude"] = "ok"
+        row["rc"] = "up" if exec_in(name, "tmux has-session -t rc").returncode == 0 else "down"
+        row["last"] = exec_in(name, "tail -n 1 /home/dev/rc.log 2>/dev/null").stdout.strip()[:88]
+
+    if user["codex"]:
+        row["codex"] = "ok" if exec_in(name, "codex login status").returncode == 0 else "NO LOGIN"
+        row["cx"] = _codex_daemon(name)
+        row["codex_last"] = exec_in(name, "tail -n 1 /home/dev/codex.log 2>/dev/null").stdout.strip()[:88]
+
     return row
 
 
 def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
     host = agent_host(cfg)
-    hdr = (f"{'NAME':<14}{'PORT':<7}{'STATE':<11}{'CLAUDE':<10}{'CODEX':<10}"
-           f"{'RC LOOP':<9}{'SPAWN':<10}{'PERMS':<18}")
+    # LOOP is the tmux session around `claude remote-control`; DAEMON is the
+    # Codex app-server daemon that phones pair with.
+    # SPAWN and PERMS are Claude's knobs, SANDBOX is Codex's. SANDBOX comes
+    # last and is not padded, so the line is only as long as it has to be.
+    hdr = (f"{'NAME':<14}{'PORT':<7}{'STATE':<11}{'CLAUDE':<10}{'LOOP':<9}"
+           f"{'CODEX':<10}{'DAEMON':<9}{'SPAWN':<10}{'PERMS':<18}{'SANDBOX'}")
     print(_c("1", hdr))
     rows = []
     for user in users:
         name = user["name"]
         state = container_state(name)
-        row = _probe(name, state, quick)
-        if not user["claude"]:
-            row["claude"] = row["rc"] = "off"
-        if not user["codex"]:
-            row["codex"] = "off"
+        row = _probe(user, state, quick)
         rows.append((user, row))
         spawn = user.get("spawn", "same-dir") if user["claude"] else "-"
         perms = (user.get("permission_mode") or "default") if user["claude"] else "-"
+        sandbox = (user.get("sandbox_mode") or "default") if user["codex"] else "-"
         print(f"{name:<14}{user['port']:<7}{row['state']:<11}"
-              f"{row['claude']:<10}{row['codex']:<10}{row['rc']:<9}{spawn:<10}"
-              f"{perms:<18}")
-    for user, row in rows:
-        print(f"  {_c('2', user['name'] + ' keys:   ' + describe_key_sources(user))}")
+              f"{row['claude']:<10}{row['rc']:<9}{row['codex']:<10}{row['cx']:<9}"
+              f"{spawn:<10}{perms:<18}{sandbox}")
+    def detail(user: dict, label: str, text: str) -> None:
+        print("  " + _c("2", f"{user['name']:<12} {label:<10} {text}"))
+
+    for user, _ in rows:
+        detail(user, "keys:", describe_key_sources(user))
     for user, row in rows:
         if row["last"]:
-            print(f"  {_c('2', user['name'] + ' rc.log: ' + row['last'])}")
+            detail(user, "rc.log:", row["last"])
+        if row["codex_last"]:
+            detail(user, "codex.log:", row["codex_last"])
     print()
     print(_c("2", f"ssh: ssh -p <PORT> dev@{host}   attach: … -t 'tmux attach -t rc'"))
+    print(_c("2", "pair a phone with Codex: ./portal pair <name>"))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -868,7 +1056,9 @@ def main() -> None:
                    help="use this authorized_keys file instead of resolving a "
                         "host account")
     p.add_argument("--claude", action="store_true", help="run the supervised remote-control loop")
-    p.add_argument("--codex", action="store_true", help="allow the Codex desktop app over SSH")
+    p.add_argument("--codex", action="store_true",
+                   help="Codex: the desktop app over SSH, plus the supervised "
+                        "remote-control daemon that phones pair with")
     p.add_argument("--port", type=int, help="host sshd port (default: next free from 2201)")
     p.add_argument("--spawn", choices=SPAWN_MODES, default="same-dir",
                    help="how Remote Control creates sessions (default: same-dir; "
@@ -882,11 +1072,18 @@ def main() -> None:
     p.add_argument("--workdir", default=DEFAULT_WORKDIR, metavar="DIR",
                    help=f"working directory for the Remote Control server "
                         f"(default: {DEFAULT_WORKDIR})")
+    p.add_argument("--sandbox-mode", choices=SANDBOX_MODES, default=None,
+                   help="sandbox for Codex remote-control sessions "
+                        "(default: Codex's own, workspace-write)")
     p.set_defaults(func=cmd_add)
 
     p = add_parser("setup", help="one-time interactive logins (needs a TTY)")
     p.add_argument("name")
     p.set_defaults(func=cmd_setup)
+
+    p = add_parser("pair", help="print a fresh Codex pairing code for a phone")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_pair)
 
     p = add_parser("status", help="show every container and its login state")
     p.add_argument("-q", "--quick", action="store_true",
@@ -895,13 +1092,13 @@ def main() -> None:
 
     p = add_parser("build", help="build agent-base:latest and stop (no containers touched)")
     p.add_argument("--no-pull", action="store_true",
-                   help="build without forcing a fresh npm install")
+                   help="build without forcing fresh agent downloads")
     p.set_defaults(func=cmd_build)
 
     p = add_parser("update", help="rebuild the image with the latest claude/codex "
                                       "and recreate all containers")
     p.add_argument("--no-pull", action="store_true",
-                   help="rebuild without forcing a fresh npm install")
+                   help="rebuild without forcing fresh agent downloads")
     p.set_defaults(func=cmd_update)
 
     p = add_parser("rm", help="remove a user's container")

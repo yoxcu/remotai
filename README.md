@@ -6,8 +6,12 @@ A multi-user AI-agent host: one Docker container per person, each signed in with
 - **Claude Code Remote Control** runs supervised inside each container, so the
   person's sessions show up in claude.ai/code and the Claude apps without any
   inbound port. Spawn mode is per-user (`same-dir`, `worktree`, `session`).
-- **Codex** needs nothing but SSH: the desktop app spawns `codex app-server`
-  itself on the far side.
+- **Codex** gets both halves from one login: the desktop app connects over SSH
+  and spawns `codex app-server` itself, and a supervised `codex remote-control`
+  daemon puts the same container in the Codex phone app —
+  `./portal pair alice` prints the code.
+- Neither needs an inbound port beyond SSH, and neither is reachable without a
+  key.
 - Logins, config and SSH keys live in a per-user named volume, so rebuilding the
   image never costs anybody a login.
 
@@ -15,6 +19,7 @@ A multi-user AI-agent host: one Docker container per person, each signed in with
 ./portal build                                        # build agent-base:latest
 ./portal add alice --claude --codex                   # container on port 2201
 ./portal setup alice                                  # one-time logins (needs Alice)
+./portal pair alice                                   # pairing code for her phone
 ./portal status
 ```
 

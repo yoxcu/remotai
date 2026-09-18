@@ -1,8 +1,13 @@
 # Codex on the agent host
 
-Your container runs an SSH server. The **Codex desktop app** connects to it and
-starts `codex app-server` on the far side itself — there is no extra daemon and
-no extra port. You point the app at an SSH host alias and it does the rest.
+Your container gets you Codex two ways, off one login:
+
+- **Desktop app** — it connects over SSH and starts `codex app-server` on the
+  far side itself. No extra daemon, no extra port. Sections 1–4.
+- **Phone app** — a supervised `codex remote-control` daemon runs in the
+  container and registers it with your ChatGPT account, so the container shows
+  up in Codex on your phone. Nothing is exposed inbound; the daemon dials out.
+  Section 5.
 
 Your admin runs `portal setup <you>` with you once to sign Codex in inside the
 container. After that this is a two-minute setup on your own machine.
@@ -46,7 +51,7 @@ way:
 
 ```sh
 ssh -T agent-work 'command -v codex'
-# expect: /usr/bin/codex
+# expect: /usr/local/bin/codex
 ```
 
 If the first works and the second prints nothing, the app will fail with
@@ -100,7 +105,43 @@ The app opens the connection, launches `codex app-server` in your container, and
 you are working against the server's filesystem — your repos are under
 `~/projects`.
 
-## 5. Working in the terminal instead
+## 5. Your phone
+
+The container runs `codex remote-control` under supervision, so once it is
+signed in it registers itself with your ChatGPT account and stays registered
+across restarts. There is nothing to install and nothing to leave running on
+your laptop.
+
+1. Install Codex on your phone and sign in with the **same ChatGPT account**
+   the container is signed in as.
+2. Look for this machine in the app's list of computers. It appears under your
+   container's name — `alice`, not `alice@server`: Codex names the device after
+   the container's hostname, and unlike Claude there is no flag to change that.
+3. If it is not listed, ask your admin for a pairing code:
+
+   ```sh
+   ./portal pair alice        # on the server
+   ```
+
+   That prints a short-lived code; type it into the app. Expired codes are not
+   a problem — they can print another.
+
+Sessions you start from the phone run in your container against your repos
+under `~/projects`, the same files the desktop app and a plain SSH session see.
+
+Two things worth knowing:
+
+- Remote control needs the **ChatGPT account** login. An API key will not do —
+  Codex refuses outright. That is the same login as section 3, so if the desktop
+  app works, this will too.
+- Restarting the container (a `portal update`, say) interrupts running sessions.
+  The pairing survives; the work in flight does not.
+- Your admin may have set a **sandbox mode** for these sessions. If commands
+  come back with `bwrap: No permissions to create a new namespace`, that is not
+  something you can fix from the phone — tell them; it is a one-line change on
+  their side.
+
+## 6. Working in the terminal instead
 
 Nothing stops you from using Codex over plain SSH:
 
@@ -119,7 +160,7 @@ tmux new -s work     # later: tmux attach -t work
 Note that `rc` is a reserved session name — that is the Claude Remote Control
 loop, if you have Claude enabled too. Leave it alone.
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause |
 |---|---|
@@ -128,9 +169,11 @@ loop, if you have Claude enabled too. Leave it alone.
 | Connection drops after idle | Check `ServerAliveInterval` is in your config. |
 | `codex` says you are not logged in | The one-time `codex login` did not complete — see section 3. |
 | `Please contact your workspace admin to enable device code authentication` | Your ChatGPT workspace blocks `--device-auth`. Use the SSH tunnel in section 3 instead. |
+| The container never shows up on your phone | Check you are signed into the same ChatGPT account in both places, then ask your admin for a pairing code (`./portal pair <you>`). They can also check `~/codex.log` in your container, which records every state change of the daemon. |
+| It showed up, then went quiet | Usually the container restarted. Give it a minute; the daemon is supervised and comes back on its own. |
 | Host key changed warning | Only expected if your container's home volume was recreated. Confirm with your admin before removing the old key. |
 
-## 7. Please don't
+## 8. Please don't
 
 Don't add the container to shared automation or CI. Your container is signed in
 with **your** account, and everything run in it is attributed to you.

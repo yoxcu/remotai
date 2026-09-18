@@ -104,9 +104,10 @@ RUN userdel -r ubuntu 2>/dev/null || true; \
 #                           `codex app-server` exactly this way.
 #   /etc/profile.d/...   -> login shells (`ssh -t host`, `bash -lc`, tmux).
 #
-# claude and codex are npm globals under the default /usr prefix, so they land
-# in /usr/bin and are on the default PATH regardless; the entries below add the
-# per-user prefixes that survive `portal update` in the home volume.
+# claude is an npm global under the default /usr prefix (/usr/bin/claude) and
+# codex is the standalone installer's symlink (/usr/local/bin/codex); both are
+# on the default PATH regardless. The profile.d entries add the per-user
+# prefixes that survive `portal update` in the home volume.
 RUN rm -f /etc/ssh/ssh_host_*_key* \
     && mkdir -p /etc/ssh/authorized_keys.d /run/sshd \
     && sed -i 's/^\(session\s\+required\s\+pam_loginuid\.so\)/#\1/' /etc/pam.d/sshd \
@@ -130,14 +131,48 @@ RUN chmod 0755 /usr/local/lib/toolchain.hook.sh && /usr/local/lib/toolchain.hook
 # ---------------------------------------------------------------------------
 # 7. The agents.
 # ---------------------------------------------------------------------------
-# REFRESH is bumped by `portal update` to force a fresh pull of both CLIs.
+# REFRESH is bumped by `portal update` to force a fresh pull of both CLIs. Both
+# layers reference it, so both move together.
 ARG REFRESH=0
 RUN echo "refresh=${REFRESH}" \
-    && npm install -g --no-fund --no-audit \
-        @anthropic-ai/claude-code \
-        @openai/codex \
+    && npm install -g --no-fund --no-audit @anthropic-ai/claude-code \
     && npm cache clean --force \
-    && claude --version \
+    && claude --version
+
+# Codex comes from the standalone installer rather than npm, and it is
+# installed into an image path rather than into a home directory. Both of those
+# are forced by `codex remote-control`:
+#
+#   * the whole `remote-control` / `app-server daemon` family refuses to run
+#     unless a STANDALONE install exists at
+#     $CODEX_HOME/packages/standalone/current/codex — "because the daemon starts
+#     and updates app-server from that fixed path". The npm package does not
+#     satisfy it. Nothing else here needs the standalone layout, so there is no
+#     reason to carry both.
+#   * $CODEX_HOME is ~/.codex, which is the per-user VOLUME. Installing there
+#     would put ~350MB in every volume and let the daemon's own auto-updater
+#     drift each container onto a different Codex behind `portal update`'s back.
+#
+# So it is installed once, here, read-only and root-owned; supervisor.sh points
+# each user's ~/.codex/packages/standalone at it. The daemon is happy to run
+# from a read-only tree — only the auto-updater wants to write, and version
+# control belongs to `portal update`.
+ENV CODEX_SHARED_STANDALONE=/opt/codex/packages/standalone
+# Downloaded to a file rather than piped into `sh`: RUN uses /bin/sh with no
+# pipefail, so `curl | sh` swallows a failed or truncated download and the build
+# carries on. </dev/null for the same reason in reverse — with the script no
+# longer occupying stdin, an unexpected prompt would hang the build instead of
+# reading EOF. CODEX_HOME is set for this command only; baking it into the image
+# would point every user's Codex at this read-only tree and break their logins.
+RUN echo "refresh=${REFRESH}" \
+    && curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
+    && env CODEX_HOME=/opt/codex \
+           CODEX_INSTALL_DIR=/usr/local/bin \
+           CODEX_NON_INTERACTIVE=true \
+           sh /tmp/codex-install.sh </dev/null \
+    && rm -f /tmp/codex-install.sh \
+    && chmod -R a-w "${CODEX_SHARED_STANDALONE}" \
+    && test -x "${CODEX_SHARED_STANDALONE}/current/bin/codex" \
     && codex --version
 
 COPY supervisor.sh /usr/local/bin/supervisor.sh

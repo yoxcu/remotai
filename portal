@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """portal — manage per-person AI agent work containers on this host.
 
-users.yaml is the single source of truth. Everything else — compose.users.yml,
-the authorized_keys files under /srv/agents, the containers themselves — is
-rendered from it and is safe to throw away.
+users.yaml is the single source of truth for WHO has a container. SSH keys are
+not copied into it: each container reads the person's own
+~/.ssh/authorized_keys from their host account, bind-mounted read-only, so
+rotating a key on the host rotates it in the container too.
 
     ./portal build              build agent-base:latest
-    ./portal add <name> --key <pubkey|path> [--claude] [--codex]
+    ./portal add <name> [--claude] [--codex]
     ./portal setup <name>       one-time interactive logins (needs a TTY)
     ./portal status [-q]
     ./portal update             rebuild the image, recreate containers
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import pwd
 import socket
 import subprocess
 import sys
@@ -121,7 +123,10 @@ def load_config(required: bool = True) -> dict:
     for user in cfg["users"]:
         user.setdefault("claude", False)
         user.setdefault("codex", False)
-        user.setdefault("keys", [])
+        if user.get("keys"):
+            die(f"user '{user['name']}' still has a 'keys:' block. Keys now come "
+                "from the person's host account; replace it with:\n"
+                f"         authorized_keys: /home/{user['name']}/.ssh/authorized_keys")
     return cfg
 
 
@@ -244,33 +249,58 @@ def exec_in(name: str, script: str, tty: bool = False,
 # render
 # ---------------------------------------------------------------------------
 
-def normalise_key(raw: str) -> list[str]:
-    """Accept a literal public key, a path to one, or '-' for stdin."""
-    if raw == "-":
-        text = sys.stdin.read()
+def resolve_authorized_keys(name: str, host_user: str | None,
+                            explicit: str | None) -> str:
+    """Find the authorized_keys file this container should read.
+
+    Nothing is copied: the path goes into users.yaml and is bind-mounted
+    read-only, so the host account stays the source of truth for keys.
+    """
+    if explicit:
+        path = Path(explicit).expanduser()
     else:
-        path = Path(raw).expanduser()
-        if path.is_file():
-            text = path.read_text()
-        else:
-            text = raw
-    keys = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if not KEY_RE.match(line):
-            die(f"does not look like an SSH public key: {line[:60]!r}\n"
-                "       (pass the contents of ~/.ssh/id_ed25519.pub, or its path)")
-        keys.append(line)
+        who = host_user or name
+        try:
+            home = Path(pwd.getpwnam(who).pw_dir)
+        except KeyError:
+            die(f"no host account called {who!r}.\n"
+                f"       Create it, or point at a file directly:\n"
+                f"         ./portal add {name} --authorized-keys /path/to/authorized_keys\n"
+                f"       or reuse another account's keys:\n"
+                f"         ./portal add {name} --host-user <existing-account>")
+        path = home / ".ssh" / "authorized_keys"
+
+    if not path.exists():
+        die(f"{path} does not exist.\n"
+            "       That file is what lets anyone log into the container, and\n"
+            "       Docker would silently create a DIRECTORY in its place.\n"
+            "       Create it first (ssh-copy-id, or touch it and paste a key in).")
+    if not path.is_file():
+        die(f"{path} is not a regular file")
+    check_authorized_keys_file(path)
+    return str(path.resolve())
+
+
+def check_authorized_keys_file(path: Path) -> None:
+    """Warn about anything that will make this container unreachable."""
+    try:
+        lines = [ln.strip() for ln in path.read_text().splitlines()]
+    except OSError as exc:
+        die(f"cannot read {path}: {exc.strerror}")
+    keys = [ln for ln in lines if ln and not ln.startswith("#")]
     if not keys:
-        die(f"no usable public key found in {raw!r}")
-    return keys
+        warn(f"{path} has no keys in it — nobody will be able to log in")
+        return
+    bad = [k for k in keys if not KEY_RE.match(k)]
+    if bad:
+        warn(f"{path}: {len(bad)} line(s) do not look like SSH public keys, e.g. "
+             f"{bad[0][:50]!r}")
+    info(f"{path} — {len(keys)} key(s)")
 
 
-def user_dirs(cfg: dict, name: str) -> tuple[Path, Path, Path]:
+def user_dirs(cfg: dict, name: str) -> tuple[Path, Path]:
     base = Path(cfg["srv_root"]) / name
-    return base, base / "projects", base / "ssh"
+    return base, base / "projects"
 
 
 def render(cfg: dict, quiet: bool = False) -> None:
@@ -289,10 +319,9 @@ def render(cfg: dict, quiet: bool = False) -> None:
             die(f"port {port} is claimed by both '{seen_ports[port]}' and '{name}'")
         seen_ports[port] = name
 
-        base, projects, sshdir = user_dirs(cfg, name)
+        base, projects = user_dirs(cfg, name)
         try:
             projects.mkdir(parents=True, exist_ok=True)
-            sshdir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             die(f"cannot create {base}: {exc.strerror} — run portal as root, or "
                 f"give yourself write access to {cfg['srv_root']}")
@@ -301,26 +330,16 @@ def render(cfg: dict, quiet: bool = False) -> None:
         except (PermissionError, OSError):
             warn(f"could not chown {projects} to {uid}:{gid} — run portal as root "
                  "or fix it by hand if the container cannot write there")
-        try:
-            os.chmod(sshdir, 0o755)
-        except OSError:
-            warn(f"could not chmod {sshdir}; sshd may reject the key file")
 
-        # authorized_keys, rendered fresh every time. Mounted read-only, so
-        # this file is the only way into the container.
-        akeys = sshdir / "dev"
-        body = (
-            f"# GENERATED by ./portal from {USERS_YAML.name} — do not edit.\n"
-            f"# user: {name}\n"
-        ) + "".join(k + "\n" for k in user["keys"])
-        try:
-            akeys.write_text(body)
-            os.chmod(akeys, 0o644)
-        except OSError as exc:
-            die(f"cannot write {akeys}: {exc.strerror} — run portal as root, or "
-                f"take ownership of {cfg['srv_root']}")
-        if not user["keys"]:
-            warn(f"user '{name}' has no SSH keys — nobody can log into work-{name}")
+        akeys = user.get("authorized_keys")
+        if not akeys:
+            die(f"user '{name}' has no authorized_keys path in {USERS_YAML.name}")
+        if not Path(akeys).is_file():
+            # Docker would create a DIRECTORY at a missing bind source, inside
+            # somebody's ~/.ssh. Refuse rather than let that happen.
+            die(f"{akeys} (for '{name}') is missing or is not a regular file.\n"
+                f"       Recreate it, or point '{name}' at another file in "
+                f"{USERS_YAML.name}.")
 
         services[f"work-{name}"] = {
             "image": IMAGE,
@@ -338,10 +357,19 @@ def render(cfg: dict, quiet: bool = False) -> None:
             "volumes": [
                 f"{name}-home:/home/dev",
                 f"{projects}:/home/dev/projects",
-                # Host-rendered, read-only: a user cannot add keys to their own
-                # container. Directory mount rather than a file mount so that
-                # rewriting the file (new inode) is picked up.
-                f"{sshdir}:/etc/ssh/authorized_keys.d:ro",
+                # The person's own host authorized_keys, read-only. Staged at
+                # /run rather than mounted onto the path sshd reads: it arrives
+                # with the HOST user's ownership, which StrictModes rejects, so
+                # supervisor.sh syncs it to a root-owned copy.
+                # create_host_path: false so a missing source is an error
+                # instead of Docker inventing a directory in someone's ~/.ssh.
+                {
+                    "type": "bind",
+                    "source": akeys,
+                    "target": "/run/host-authorized-keys",
+                    "read_only": True,
+                    "bind": {"create_host_path": False},
+                },
             ],
         }
         volumes[f"{name}-home"] = {"name": f"{name}-home"}
@@ -397,9 +425,7 @@ def cmd_add(args: argparse.Namespace) -> None:
         die(f"user '{name}' already exists — use './portal rm {name}' first, "
             f"or edit {USERS_YAML.name}")
 
-    keys: list[str] = []
-    for raw in args.key:
-        keys.extend(normalise_key(raw))
+    akeys = resolve_authorized_keys(name, args.host_user, args.authorized_keys)
 
     taken = {int(u["port"]) for u in cfg["users"]}
     if args.port:
@@ -419,12 +445,14 @@ def cmd_add(args: argparse.Namespace) -> None:
 
     cfg["users"].append({
         "name": name, "port": port,
-        "claude": claude, "codex": codex, "keys": keys,
+        "claude": claude, "codex": codex,
+        "authorized_keys": akeys,
     })
     cfg["users"].sort(key=lambda u: u["name"])
     save_config(cfg)
     info(f"added '{name}' to {USERS_YAML.name} (port {port}, "
-         f"claude={claude}, codex={codex}, {len(keys)} key(s))")
+         f"claude={claude}, codex={codex})")
+    info(f"keys come from {akeys} — that file stays the source of truth")
 
     render(cfg)
     ensure_image(cfg)
@@ -605,7 +633,7 @@ def cmd_rm(args: argparse.Namespace) -> None:
     cfg = load_config()
     user = find_user(cfg, args.name)
     name = user["name"]
-    base, _, _ = user_dirs(cfg, name)
+    base, _ = user_dirs(cfg, name)
 
     if not args.yes and not confirm(f"stop and remove container work-{name}?"):
         die("aborted", 2)
@@ -647,8 +675,12 @@ def main() -> None:
 
     p = sub.add_parser("add", help="create a work container for a person")
     p.add_argument("name")
-    p.add_argument("--key", action="append", required=True, metavar="PUBKEY|PATH|-",
-                   help="SSH public key, a path to one, or '-' for stdin (repeatable)")
+    p.add_argument("--host-user", metavar="ACCOUNT",
+                   help="host account whose ~/.ssh/authorized_keys to use "
+                        "(default: the same name)")
+    p.add_argument("--authorized-keys", metavar="PATH",
+                   help="use this authorized_keys file instead of resolving a "
+                        "host account")
     p.add_argument("--claude", action="store_true", help="run the supervised remote-control loop")
     p.add_argument("--codex", action="store_true", help="allow the Codex desktop app over SSH")
     p.add_argument("--port", type=int, help="host sshd port (default: next free from 2201)")

@@ -88,7 +88,25 @@ passwordless sudo, but the container is rebuilt from a fresh image on every
   `npm install -g` after `npm config set prefix ~/.npm-global` (already on your
   PATH).
 
-## 4. Housekeeping
+## 4. Adding a machine
+
+Your container accepts exactly the keys in your **own**
+`~/.ssh/authorized_keys` on the server — the same file you already use to log
+into the host. Working from a new laptop:
+
+```sh
+ssh-copy-id -p 22 you@your-server     # your normal host login
+```
+
+The container picks the new key up within about 15 seconds. You do not need
+your admin, and you cannot edit the key list from inside the container (it is
+mounted read-only there, on purpose).
+
+If you use an editor that *replaces* the file rather than appending to it, ask
+your admin to `docker restart` your container — the mount follows the original
+file.
+
+## 5. Housekeeping
 
 `~/rc.log` is the server's own log — start/stop times, exit codes, and anything
 it wrote to stderr:
@@ -105,7 +123,7 @@ hours after a restart):
 tmux attach -t rc     # Ctrl-C, then watch it come back
 ```
 
-## 5. Please don't
+## 6. Please don't
 
 Do not set `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
 `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_BASE_URL` in your `~/.bashrc` or

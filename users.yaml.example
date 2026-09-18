@@ -1,17 +1,26 @@
-# users.yaml — the single source of truth for the agent host.
+# users.yaml — who has a container on this agent host.
 #
-# `portal` reads this file and renders compose.users.yml from it.
-# Edit by hand if you like, then run `./portal update` (or `./portal render`)
-# to apply. `portal add` / `portal rm` maintain it for you.
+# NOTE: no SSH keys live here. Each container reads the person's own
+# ~/.ssh/authorized_keys from their host account, bind-mounted read-only.
+# They rotate a key on the host and the container picks it up within ~15s.
+#
+# `portal` renders compose.users.yml from this file.
+# `portal add` / `portal rm` maintain it; hand edits are fine (comments are not
+# preserved across those two commands).
 
-# Directory on the host that holds per-user project bind mounts and the
-# generated authorized_keys files. Created by `portal add`.
+# Where per-user project directories live. Created by `portal add`.
 srv_root: /srv/agents
 
 # Hostname used in the Remote Control session name ("<name>@<host>") so you can
 # tell this server apart from others in claude.ai/code. Defaults to the host's
 # own hostname when unset.
 #host: agents.example.com
+
+# UID/GID baked into the image, so bind-mounted projects are writable from both
+# sides. Defaults to whoever runs portal (SUDO_UID under sudo). Pin it here if
+# more than one person runs portal.
+#uid: 1000
+#gid: 1000
 
 users:
   - name: alice
@@ -23,14 +32,12 @@ users:
     # Allow the Codex desktop app to connect over SSH. Needs no extra process:
     # the app spawns `codex app-server` itself through the login shell.
     codex: true
-    # One or more SSH public keys. These become /etc/ssh/authorized_keys.d/dev
-    # inside the container, mounted read-only from the host.
-    keys:
-      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyReplaceMe alice@laptop
+    # Resolved by `portal add` from the matching host account. Point it
+    # somewhere else if the container name and the host account differ.
+    authorized_keys: /home/alice/.ssh/authorized_keys
 
   - name: bob
     port: 2202
     claude: true
     codex: false
-    keys:
-      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnotherExampleKey bob@desktop
+    authorized_keys: /home/bob/.ssh/authorized_keys

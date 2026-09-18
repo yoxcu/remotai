@@ -7,11 +7,12 @@
 # It builds the image, creates a throwaway user called `test` on port 2299,
 # and checks the things that actually break in practice:
 #
-#   * key-only SSH login works
+#   * key-only SSH login works, using an authorized_keys file on the host
 #   * password auth and root login are refused
 #   * claude and codex are on PATH for a NON-login `ssh host 'cmd'` (the way
 #     the Codex desktop app spawns app-server) and for a login shell
-#   * authorized_keys is read-only inside the container
+#   * authorized_keys is synced from the host file and read-only inside
+#   * adding a key on the host reaches the container without a restart
 #   * no banned auth/telemetry variable leaks into the container
 #   * the supervisor restarts the remote-control loop when it is killed,
 #     and restarts sshd when that is killed
@@ -140,6 +141,10 @@ echo "   ok"
 mkdir -p "${WORK}"
 if [ -f users.yaml ]; then HAD_USERS_YAML=1; cp -a users.yaml "${BACKUP}"; fi
 ssh-keygen -q -t ed25519 -N '' -f "${KEY}" -C 'smoke-test' </dev/null
+ssh-keygen -q -t ed25519 -N '' -f "${KEY}2" -C 'smoke-test-rotated' </dev/null
+# Stand in for a real host account's ~/.ssh/authorized_keys.
+HOST_AKEYS="${WORK}/host_authorized_keys"
+cp "${KEY}.pub" "${HOST_AKEYS}"
 
 say "1. build agent-base"
 if ./portal build --no-pull; then ok "image builds"; else bad "image builds"; exit "${FAIL}"; fi
@@ -151,7 +156,7 @@ check_out "dev user exists with the build uid" '^uid=' \
     docker run --rm --entrypoint id agent-base:latest dev
 
 say "2. portal add ${USER_NAME}"
-if ./portal add "${USER_NAME}" --key "${KEY}.pub" --claude --codex --port "${PORT}"; then
+if ./portal add "${USER_NAME}" --authorized-keys "${HOST_AKEYS}" --claude --codex --port "${PORT}"; then
     ok "portal add"
 else
     bad "portal add"; exit "${FAIL}"
@@ -181,8 +186,10 @@ check "root login refused" 255 \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile="${KNOWN}" \
         -o ConnectTimeout=5 -o LogLevel=ERROR \
         -T "root@${SSH_HOST}" true
-check "authorized_keys is read-only in the container" 1 \
-    docker exec "${CONTAINER}" bash -c 'echo x >> /etc/ssh/authorized_keys.d/dev'
+check "the host authorized_keys mount is read-only" 1 \
+    docker exec "${CONTAINER}" bash -c 'echo x >> /run/host-authorized-keys'
+check_out "container authorized_keys is root-owned (StrictModes needs this)" '^root root$' \
+    docker exec "${CONTAINER}" stat -c '%U %G' /etc/ssh/authorized_keys.d/dev
 
 say "5. PATH — the check the Codex desktop app depends on"
 # `ssh host 'cmd'` runs bash NON-login and NON-interactive: it reads neither
@@ -256,7 +263,28 @@ fi
 check "container never restarted (supervisor handled it in-process)" 0 \
     bash -c "[ \"\$(docker inspect -f '{{.RestartCount}}' ${CONTAINER})\" = 0 ]"
 
-say "9. persistence across a recreate"
+say "9. host-side key rotation"
+# The point of host-account passthrough: adding a key on the host must let that
+# key in, with no portal command and no restart.
+cat "${KEY}2.pub" >> "${HOST_AKEYS}"
+rotated=0
+deadline=$(( SECONDS + 60 ))
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+    sleep 3
+    if ssh -i "${KEY}2" -p "${PORT}" -o IdentitiesOnly=yes \
+           -o StrictHostKeyChecking=no -o UserKnownHostsFile="${KNOWN}" \
+           -o ConnectTimeout=5 -o LogLevel=ERROR -T "dev@${SSH_HOST}" true 2>/dev/null; then
+        rotated=1; break
+    fi
+done
+if [ "${rotated}" = 1 ]; then
+    ok "a key added to the host file works without restarting the container"
+else
+    bad "a key added to the host file works without restarting the container"
+    note "$(docker exec "${CONTAINER}" cat /etc/ssh/authorized_keys.d/dev 2>&1 | tail -2 | tr '\n' '|')"
+fi
+
+say "10. persistence across a recreate"
 marker="smoke-$(date +%s)"
 ssh_cmd "echo ${marker} > ~/.smoke-marker" >/dev/null 2>&1
 docker compose -f docker-compose.yml -f compose.users.yml up -d --force-recreate "${CONTAINER}" >/dev/null 2>&1

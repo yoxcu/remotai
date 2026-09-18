@@ -18,7 +18,12 @@ services:
     volumes:
     - alice-home:/home/dev
     - /srv/agents/alice/projects:/home/dev/projects
-    - /srv/agents/alice/ssh:/etc/ssh/authorized_keys.d:ro
+    - type: bind
+      source: /home/alice/.ssh/authorized_keys
+      target: /run/host-authorized-keys
+      read_only: true
+      bind:
+        create_host_path: false
   work-bob:
     image: agent-base:latest
     container_name: work-bob
@@ -35,7 +40,12 @@ services:
     volumes:
     - bob-home:/home/dev
     - /srv/agents/bob/projects:/home/dev/projects
-    - /srv/agents/bob/ssh:/etc/ssh/authorized_keys.d:ro
+    - type: bind
+      source: /home/bob/.ssh/authorized_keys
+      target: /run/host-authorized-keys
+      read_only: true
+      bind:
+        create_host_path: false
 volumes:
   alice-home:
     name: alice-home

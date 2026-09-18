@@ -13,7 +13,7 @@ A multi-user AI-agent host: one Docker container per person, each signed in with
 
 ```sh
 ./portal build                                        # build agent-base:latest
-./portal add alice --key alice.pub --claude --codex   # container on port 2201
+./portal add alice --claude --codex                   # container on port 2201
 ./portal setup alice                                  # one-time logins (needs Alice)
 ./portal status
 ```
@@ -24,6 +24,8 @@ A multi-user AI-agent host: one Docker container per person, each signed in with
 | [docs/USER-CLAUDE.md](docs/USER-CLAUDE.md) | hand to each Claude user |
 | [docs/USER-CODEX.md](docs/USER-CODEX.md) | hand to each Codex user |
 
-`users.yaml` is the source of truth; `compose.users.yml` and every
-`authorized_keys` file are rendered from it. Run `./smoke-test.sh` on the server
+`users.yaml` says who has a container and `compose.users.yml` is rendered from
+it. SSH keys are not copied anywhere: each container reads that person's own
+`~/.ssh/authorized_keys` from their host account, mounted read-only, so
+rotating a key on the host rotates it in the container. Run `./smoke-test.sh` on the server
 to check a deployment end to end.

@@ -89,7 +89,7 @@ loop, if you have Claude enabled too. Leave it alone.
 
 | Symptom | Cause |
 |---|---|
-| `Permission denied (publickey)` | Your key is not in the container's authorized_keys. Only your admin can add it — it is generated from `users.yaml` on the host and mounted read-only. |
+| `Permission denied (publickey)` | Your container reads your **own** `~/.ssh/authorized_keys` on the server. Add the key there (`ssh-copy-id`, or append to the file) and it works within ~15s — no admin needed. |
 | App says it cannot start the app server | Run the `ssh -T agent-work 'command -v codex'` check above. |
 | Connection drops after idle | Check `ServerAliveInterval` is in your config. |
 | `codex` says you are not logged in | The one-time `codex login` did not complete. Ask your admin to rerun `portal setup <you>`. |

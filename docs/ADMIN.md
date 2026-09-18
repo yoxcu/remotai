@@ -3,12 +3,16 @@
 One Docker image, one container per person, one `users.yaml`.
 
 ```
-users.yaml  ──portal──▶  compose.users.yml           (containers)
-                    └──▶  /srv/agents/<name>/ssh/dev  (authorized_keys)
+users.yaml  ──portal──▶  compose.users.yml   (containers)
+
+/home/<name>/.ssh/authorized_keys  ──bind,ro──▶  work-<name>
 ```
 
-`users.yaml` is the only file you edit. Everything else is rendered and is safe
-to delete and regenerate. No container is given the Docker socket.
+`users.yaml` says **who** has a container. It holds no SSH keys: each container
+reads that person's own `~/.ssh/authorized_keys` from their host account,
+mounted read-only. Rotating a key on the host rotates it in the container,
+within about 15 seconds and with no restart. No container is given the Docker
+socket.
 
 ## Requirements
 
@@ -43,14 +47,26 @@ sudo usermod -aG docker "$USER"      # log out and back in
 
 ## Adding a user
 
+Alice needs a **host account** with a populated `~/.ssh/authorized_keys` — the
+same file she already uses to SSH into this server:
+
 ```sh
-./portal add alice --key ~/keys/alice.pub --claude --codex
+./portal add alice --claude --codex
 ```
 
-`--key` takes a literal key, a path to a `.pub` file, or `-` for stdin, and may
-be repeated. The port is auto-assigned from 2201 upward; pass `--port` to pin
-one. This creates `/srv/agents/alice/{projects,ssh}`, renders everything, and
-starts `work-alice`.
+That resolves `/home/alice/.ssh/authorized_keys`, records the path in
+`users.yaml`, creates `/srv/agents/alice/projects`, and starts `work-alice`. The
+port is auto-assigned from 2201 upward; pass `--port` to pin one.
+
+If the container name and the host account differ, or the keys live elsewhere:
+
+```sh
+./portal add alice --host-user a.smith --claude      # different account
+./portal add ci --authorized-keys /etc/ci/keys --codex  # no host account
+```
+
+`portal add` refuses if the file does not exist, rather than letting Docker
+create a *directory* called `authorized_keys` inside somebody's `~/.ssh`.
 
 Then, **with Alice present** (every step needs someone at a browser):
 
@@ -114,6 +130,26 @@ the image without moving versions.
 
 Do this on a weekday morning, not mid-sprint: recreating a container interrupts
 whatever sessions were running. They come back, but the work in flight does not.
+
+---
+
+## Rotating and revoking keys
+
+Nothing to run. Alice edits `~/.ssh/authorized_keys` on the host and the
+container picks it up within about 15 seconds — `supervisor.sh` polls the
+read-only mount and copies it to a root-owned file that sshd reads. (The copy
+exists because the mounted file carries Alice's host UID, which is neither root
+nor `dev` inside the container, and sshd's `StrictModes` rejects exactly that.)
+
+One caveat worth knowing: the bind mount follows the file's **inode**. Appending
+(`>>`, `ssh-copy-id`, most editors) is picked up live. A tool that writes a
+replacement file and renames it over the top is not — the container keeps
+reading the old inode until `docker restart work-alice`.
+
+```sh
+docker exec work-alice cat /etc/ssh/authorized_keys.d/dev   # what sshd sees
+docker logs work-alice | grep authorized_keys               # sync history
+```
 
 ---
 
@@ -240,9 +276,14 @@ The Codex desktop app follows `ProxyJump` fine.
 
 - Key-only auth, no passwords, no root login — enforced in `docker/sshd_config`.
 - Only the `dev` account can log in (`AllowUsers dev`).
-- `authorized_keys` is rendered on the host and mounted **read-only**, so a user
-  cannot grant access to their own container. Rotating a key means editing
-  `users.yaml` and running `./portal render && ./portal update`.
+- `authorized_keys` comes from the person's host account and is mounted
+  **read-only**, so they cannot add keys from inside the container. Note the
+  flip side: whoever can edit `/home/alice/.ssh/authorized_keys` on the host —
+  Alice, and root — controls who reaches `work-alice`. That is the same trust
+  boundary as her host account, which is the point, but it does mean a
+  compromised host account is a compromised container.
+- Revoking access means removing the key from the host file (effective within
+  ~15s), or `./portal rm alice`.
 - Users have passwordless sudo **inside** their container. The container
   boundary is the security boundary; do not treat these as isolated from each
   other beyond what Docker gives you. Anyone with sudo in a container plus a
@@ -262,7 +303,7 @@ The Codex desktop app follows `ProxyJump` fine.
 | `docker/supervisor.sh` | sshd + the remote-control loop |
 | `docker/sshd_config` | key-only sshd |
 | `/srv/agents/<name>/projects` | bind-mounted to `~/projects` |
-| `/srv/agents/<name>/ssh/dev` | generated authorized_keys, mounted read-only |
+| `/home/<name>/.ssh/authorized_keys` | the host account's keys, mounted read-only |
 | volume `<name>-home` | `/home/dev` — credentials, config, host keys |
 
 ## Troubleshooting
@@ -273,7 +314,8 @@ environment variable it had to strip.
 
 | Symptom | Look at |
 |---|---|
-| Nobody can SSH in | `docker logs work-alice` — it warns if authorized_keys is missing or empty. Then `./portal render`. |
+| Nobody can SSH in | `docker logs work-alice` — it warns if the host file is unmounted or has no keys in it. |
+| A new key on the host does not work | It syncs within ~15s **if the file was edited in place**. An editor that replaces the file gets a new inode, which the bind mount does not follow: `docker restart work-alice`. `ssh-copy-id` and `>>` append in place and are fine. |
 | Session missing from claude.ai/code | `./portal status`; then `docker exec -it work-alice su -l dev -c 'tail -40 ~/rc.log'` |
 | rc loop says "not signed in" | `./portal setup alice` |
 | Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/bin/codex` |

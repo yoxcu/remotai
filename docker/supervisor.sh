@@ -27,6 +27,14 @@ RC_RESTART_DELAY="${RC_RESTART_DELAY:-5}"      # between `claude remote-control`
 RC_AUTH_POLL="${RC_AUTH_POLL:-30}"             # between re-checks while not logged in
 RC_SUPERVISE_POLL="${RC_SUPERVISE_POLL:-10}"   # between "is the tmux session alive"
 RC_LOG_MAX=$(( 8 * 1024 * 1024 ))
+# The person's own authorized_keys from their host account, bind-mounted
+# read-only. It is staged rather than mounted straight onto the path sshd reads
+# because it carries the HOST user's ownership, which is neither root nor `dev`
+# inside the container — sshd's StrictModes rejects exactly that. Syncing it to
+# a root-owned copy keeps StrictModes on.
+HOST_AKEYS="${HOST_AKEYS:-/run/host-authorized-keys}"
+AKEYS="${AKEYS:-/etc/ssh/authorized_keys.d/dev}"
+AKEYS_POLL="${AKEYS_POLL:-15}"
 
 AGENT_NAME="${AGENT_NAME:-${DEV_USER}}"
 AGENT_HOST="${AGENT_HOST:-$(hostname)}"
@@ -98,14 +106,50 @@ ensure_host_keys() {
     chmod 644 "${HOST_KEY_DIR}"/ssh_host_*_key.pub
 }
 
-check_authorized_keys() {
-    local f=/etc/ssh/authorized_keys.d/${DEV_USER}
-    if [ ! -s "${f}" ]; then
-        log "WARNING: ${f} is missing or empty — nobody can log in."
-        log "         Run './portal update' on the host to render it from users.yaml."
-    else
-        log "$(grep -cvE '^\s*(#|$)' "${f}") authorized key(s) mounted from the host"
+# Copy the host account's authorized_keys into place if it has changed.
+# Picks up in-place edits (`>>`, `ssh-copy-id`, most editors) within AKEYS_POLL
+# seconds. If the file is REPLACED with a new inode, the bind mount still points
+# at the old one and the container has to be restarted — see docs/ADMIN.md.
+sync_authorized_keys() {
+    if [ ! -f "${HOST_AKEYS}" ]; then
+        return 1
     fi
+    if cmp -s "${HOST_AKEYS}" "${AKEYS}" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${AKEYS}")"
+    install -m 0644 -o root -g root "${HOST_AKEYS}" "${AKEYS}" || return 1
+    log "authorized_keys synced from the host account ($(count_keys) key(s))"
+    return 0
+}
+
+# Actual keys, not lines: a file of nothing but comments is still unusable.
+count_keys() {
+    # grep -c prints 0 AND exits 1 when nothing matches, so take the exit
+    # status as the signal and never append a second value.
+    local n
+    n=$(grep -cvE '^[[:space:]]*(#|$)' "${AKEYS}" 2>/dev/null) || n=0
+    printf '%s' "${n:-0}"
+}
+
+check_authorized_keys() {
+    if ! sync_authorized_keys; then
+        log "WARNING: ${HOST_AKEYS} is not mounted — nobody can log in."
+        log "         Check that the host account's ~/.ssh/authorized_keys exists,"
+        log "         then run './portal update' on the host."
+        return
+    fi
+    if [ "$(count_keys)" -eq 0 ]; then
+        log "WARNING: the host account's authorized_keys has no keys in it —"
+        log "         nobody can log in. Add one on the host; it syncs within ${AKEYS_POLL}s."
+    fi
+}
+
+supervise_authorized_keys() {
+    while :; do
+        sleep "${AKEYS_POLL}"
+        sync_authorized_keys >/dev/null 2>&1
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -234,6 +278,7 @@ trap shutdown TERM INT
 
 set -m   # each service in its own process group, so shutdown can signal the tree
 supervise_sshd & CHILDREN+=("$!")
+supervise_authorized_keys & CHILDREN+=("$!")
 if [ "${AGENT_CLAUDE}" = "1" ]; then
     supervise_rc & CHILDREN+=("$!")
 else

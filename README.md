@@ -25,7 +25,8 @@ A multi-user AI-agent host: one Docker container per person, each signed in with
 | [docs/USER-CODEX.md](docs/USER-CODEX.md) | hand to each Codex user |
 
 `users.yaml` says who has a container and `compose.users.yml` is rendered from
-it. SSH keys are not copied anywhere: each container reads that person's own
-`~/.ssh/authorized_keys` from their host account, mounted read-only, so
-rotating a key on the host rotates it in the container. Run `./smoke-test.sh` on the server
+it. Each container accepts the person's own `~/.ssh/authorized_keys` from their
+host account (mounted read-only, so rotating a key on the host rotates it in the
+container) plus any `extra_keys` listed for them in `users.yaml`, for machines
+with no account here. Run `./smoke-test.sh` on the server
 to check a deployment end to end.

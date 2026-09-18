@@ -33,6 +33,10 @@ RC_LOG_MAX=$(( 8 * 1024 * 1024 ))
 # inside the container — sshd's StrictModes rejects exactly that. Syncing it to
 # a root-owned copy keeps StrictModes on.
 HOST_AKEYS="${HOST_AKEYS:-/run/host-authorized-keys}"
+# Extra keys rendered by portal from users.yaml, for machines and people with
+# no account on this host. Mounted as a DIRECTORY so rewriting the file is
+# picked up without recreating the container.
+EXTRA_AKEYS="${EXTRA_AKEYS:-/run/portal-keys/extra}"
 AKEYS="${AKEYS:-/etc/ssh/authorized_keys.d/dev}"
 AKEYS_POLL="${AKEYS_POLL:-15}"
 
@@ -111,15 +115,36 @@ ensure_host_keys() {
 # seconds. If the file is REPLACED with a new inode, the bind mount still points
 # at the old one and the container has to be restarted — see docs/ADMIN.md.
 sync_authorized_keys() {
-    if [ ! -f "${HOST_AKEYS}" ]; then
+    local tmp sources=""
+    tmp=$(mktemp) || return 1
+
+    if [ -f "${HOST_AKEYS}" ]; then
+        printf '# --- from the host account ---\n' >>"${tmp}"
+        cat "${HOST_AKEYS}" >>"${tmp}"
+        printf '\n' >>"${tmp}"
+        sources="host account"
+    fi
+    if [ -f "${EXTRA_AKEYS}" ]; then
+        printf '# --- extra_keys from users.yaml ---\n' >>"${tmp}"
+        cat "${EXTRA_AKEYS}" >>"${tmp}"
+        sources="${sources:+${sources} + }users.yaml"
+    fi
+    if [ -z "${sources}" ]; then
+        rm -f "${tmp}"
         return 1
     fi
-    if cmp -s "${HOST_AKEYS}" "${AKEYS}" 2>/dev/null; then
+
+    if cmp -s "${tmp}" "${AKEYS}" 2>/dev/null; then
+        rm -f "${tmp}"
         return 0
     fi
     mkdir -p "$(dirname "${AKEYS}")"
-    install -m 0644 -o root -g root "${HOST_AKEYS}" "${AKEYS}" || return 1
-    log "authorized_keys synced from the host account ($(count_keys) key(s))"
+    if ! install -m 0644 -o root -g root "${tmp}" "${AKEYS}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    rm -f "${tmp}"
+    log "authorized_keys synced from ${sources} ($(count_keys) key(s))"
     return 0
 }
 
@@ -134,14 +159,16 @@ count_keys() {
 
 check_authorized_keys() {
     if ! sync_authorized_keys; then
-        log "WARNING: ${HOST_AKEYS} is not mounted — nobody can log in."
-        log "         Check that the host account's ~/.ssh/authorized_keys exists,"
-        log "         then run './portal update' on the host."
+        log "WARNING: neither ${HOST_AKEYS} nor ${EXTRA_AKEYS} is mounted —"
+        log "         nobody can log in. Check the host account's"
+        log "         ~/.ssh/authorized_keys exists, then run './portal update'."
         return
     fi
     if [ "$(count_keys)" -eq 0 ]; then
-        log "WARNING: the host account's authorized_keys has no keys in it —"
-        log "         nobody can log in. Add one on the host; it syncs within ${AKEYS_POLL}s."
+        log "WARNING: no keys from any source — nobody can log in."
+        log "         Add one to the host account's ~/.ssh/authorized_keys, or to"
+        log "         extra_keys in users.yaml then './portal render'. Either is"
+        log "         picked up within ${AKEYS_POLL}s; no restart needed."
     fi
 }
 

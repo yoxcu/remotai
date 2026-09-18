@@ -1,8 +1,13 @@
 # users.yaml — who has a container on this agent host.
 #
-# NOTE: no SSH keys live here. Each container reads the person's own
-# ~/.ssh/authorized_keys from their host account, bind-mounted read-only.
-# They rotate a key on the host and the container picks it up within ~15s.
+# Each container accepts two sets of keys, concatenated:
+#   authorized_keys:  a file on the host, bind-mounted read-only. Normally the
+#                     person's own ~/.ssh/authorized_keys, so rotating a key on
+#                     the host rotates it in the container.
+#   extra_keys:       keys listed here, for machines or people with no account
+#                     on this host.
+# Either may be omitted, but not both. Both are picked up within ~15s of
+# changing (run `./portal render` after editing extra_keys); no restart needed.
 #
 # `portal` renders compose.users.yml from this file.
 # `portal add` / `portal rm` maintain it; hand edits are fine (comments are not
@@ -35,9 +40,20 @@ users:
     # Resolved by `portal add` from the matching host account. Point it
     # somewhere else if the container name and the host account differ.
     authorized_keys: /home/alice/.ssh/authorized_keys
+    # Anything extra, on top of that file.
+    extra_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyReplaceMe alice@work-laptop
 
   - name: bob
     port: 2202
     claude: true
     codex: false
     authorized_keys: /home/bob/.ssh/authorized_keys
+
+  # No host account: extra_keys carries this one on its own.
+  - name: ci
+    port: 2203
+    claude: false
+    codex: true
+    extra_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyReplaceMe ci@runner

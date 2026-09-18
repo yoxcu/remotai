@@ -106,6 +106,9 @@ If you use an editor that *replaces* the file rather than appending to it, ask
 your admin to `docker restart` your container — the mount follows the original
 file.
 
+Your admin can also add keys directly (`extra_keys` in `users.yaml`), which is
+how a machine with no account on this server gets in.
+
 ## 5. Housekeeping
 
 `~/rc.log` is the server's own log — start/stop times, exit codes, and anything

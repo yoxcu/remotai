@@ -18,36 +18,32 @@ services:
     volumes:
     - alice-home:/home/dev
     - /srv/agents/alice/projects:/home/dev/projects
+    - /srv/agents/alice/ssh:/run/portal-keys:ro
     - type: bind
       source: /home/alice/.ssh/authorized_keys
       target: /run/host-authorized-keys
       read_only: true
       bind:
         create_host_path: false
-  work-bob:
+  work-ci:
     image: agent-base:latest
-    container_name: work-bob
-    hostname: bob
+    container_name: work-ci
+    hostname: ci
     restart: unless-stopped
     stop_grace_period: 20s
     environment:
-      AGENT_NAME: bob
+      AGENT_NAME: ci
       AGENT_HOST: agents.example.com
-      AGENT_CLAUDE: '1'
-      AGENT_CODEX: '0'
+      AGENT_CLAUDE: '0'
+      AGENT_CODEX: '1'
     ports:
-    - 0.0.0.0:2202:22
+    - 0.0.0.0:2203:22
     volumes:
-    - bob-home:/home/dev
-    - /srv/agents/bob/projects:/home/dev/projects
-    - type: bind
-      source: /home/bob/.ssh/authorized_keys
-      target: /run/host-authorized-keys
-      read_only: true
-      bind:
-        create_host_path: false
+    - ci-home:/home/dev
+    - /srv/agents/ci/projects:/home/dev/projects
+    - /srv/agents/ci/ssh:/run/portal-keys:ro
 volumes:
   alice-home:
     name: alice-home
-  bob-home:
-    name: bob-home
+  ci-home:
+    name: ci-home

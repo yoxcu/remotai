@@ -13,6 +13,7 @@
 #     the Codex desktop app spawns app-server) and for a login shell
 #   * authorized_keys is synced from the host file and read-only inside
 #   * adding a key on the host reaches the container without a restart
+#   * an extra_keys entry in users.yaml also gets in
 #   * no banned auth/telemetry variable leaks into the container
 #   * the supervisor restarts the remote-control loop when it is killed,
 #     and restarts sshd when that is killed
@@ -142,6 +143,7 @@ mkdir -p "${WORK}"
 if [ -f users.yaml ]; then HAD_USERS_YAML=1; cp -a users.yaml "${BACKUP}"; fi
 ssh-keygen -q -t ed25519 -N '' -f "${KEY}" -C 'smoke-test' </dev/null
 ssh-keygen -q -t ed25519 -N '' -f "${KEY}2" -C 'smoke-test-rotated' </dev/null
+ssh-keygen -q -t ed25519 -N '' -f "${KEY}3" -C 'smoke-test-extra' </dev/null
 # Stand in for a real host account's ~/.ssh/authorized_keys.
 HOST_AKEYS="${WORK}/host_authorized_keys"
 cp "${KEY}.pub" "${HOST_AKEYS}"
@@ -156,7 +158,8 @@ check_out "dev user exists with the build uid" '^uid=' \
     docker run --rm --entrypoint id agent-base:latest dev
 
 say "2. portal add ${USER_NAME}"
-if ./portal add "${USER_NAME}" --authorized-keys "${HOST_AKEYS}" --claude --codex --port "${PORT}"; then
+if ./portal add "${USER_NAME}" --authorized-keys "${HOST_AKEYS}" \
+        --key "${KEY}3.pub" --claude --codex --port "${PORT}"; then
     ok "portal add"
 else
     bad "portal add"; exit "${FAIL}"
@@ -190,6 +193,10 @@ check "the host authorized_keys mount is read-only" 1 \
     docker exec "${CONTAINER}" bash -c 'echo x >> /run/host-authorized-keys'
 check_out "container authorized_keys is root-owned (StrictModes needs this)" '^root root$' \
     docker exec "${CONTAINER}" stat -c '%U %G' /etc/ssh/authorized_keys.d/dev
+check "the extra_keys mount is read-only" 1 \
+    docker exec "${CONTAINER}" bash -c 'echo x >> /run/portal-keys/extra'
+check_out "both key sources are merged" 'smoke-test-extra' \
+    docker exec "${CONTAINER}" cat /etc/ssh/authorized_keys.d/dev
 
 say "5. PATH — the check the Codex desktop app depends on"
 # `ssh host 'cmd'` runs bash NON-login and NON-interactive: it reads neither
@@ -263,7 +270,14 @@ fi
 check "container never restarted (supervisor handled it in-process)" 0 \
     bash -c "[ \"\$(docker inspect -f '{{.RestartCount}}' ${CONTAINER})\" = 0 ]"
 
-say "9. host-side key rotation"
+say "9. both key sources actually authenticate"
+# The extra key came from users.yaml, never from the host file.
+check "an extra_keys entry from users.yaml can log in" 0 \
+    ssh -i "${KEY}3" -p "${PORT}" -o IdentitiesOnly=yes \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile="${KNOWN}" \
+        -o ConnectTimeout=5 -o LogLevel=ERROR -T "dev@${SSH_HOST}" true
+
+say "9b. host-side key rotation"
 # The point of host-account passthrough: adding a key on the host must let that
 # key in, with no portal command and no restart.
 cat "${KEY}2.pub" >> "${HOST_AKEYS}"

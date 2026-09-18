@@ -266,9 +266,9 @@ def render(cfg: dict, quiet: bool = False) -> None:
         try:
             projects.mkdir(parents=True, exist_ok=True)
             sshdir.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            die(f"cannot create {base} — run portal as root, or give yourself "
-                f"write access to {cfg['srv_root']}")
+        except OSError as exc:
+            die(f"cannot create {base}: {exc.strerror} — run portal as root, or "
+                f"give yourself write access to {cfg['srv_root']}")
         try:
             os.chown(projects, uid, gid)
         except (PermissionError, OSError):
@@ -276,7 +276,7 @@ def render(cfg: dict, quiet: bool = False) -> None:
                  "or fix it by hand if the container cannot write there")
         try:
             os.chmod(sshdir, 0o755)
-        except PermissionError:
+        except OSError:
             warn(f"could not chmod {sshdir}; sshd may reject the key file")
 
         # authorized_keys, rendered fresh every time. Mounted read-only, so
@@ -289,9 +289,9 @@ def render(cfg: dict, quiet: bool = False) -> None:
         try:
             akeys.write_text(body)
             os.chmod(akeys, 0o644)
-        except PermissionError:
-            die(f"cannot write {akeys} — run portal as root, or take ownership "
-                f"of {cfg['srv_root']}")
+        except OSError as exc:
+            die(f"cannot write {akeys}: {exc.strerror} — run portal as root, or "
+                f"take ownership of {cfg['srv_root']}")
         if not user["keys"]:
             warn(f"user '{name}' has no SSH keys — nobody can log into work-{name}")
 

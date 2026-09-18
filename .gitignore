@@ -4,3 +4,5 @@ compose.users.yml
 *.pem
 id_ed25519*
 .smoke/
+__pycache__/
+*.pyc

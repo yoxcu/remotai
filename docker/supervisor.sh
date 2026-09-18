@@ -26,6 +26,8 @@ RC_SESSION=rc
 RC_RESTART_DELAY="${RC_RESTART_DELAY:-5}"      # between `claude remote-control` attempts
 RC_AUTH_POLL="${RC_AUTH_POLL:-30}"             # between re-checks while not logged in
 RC_SUPERVISE_POLL="${RC_SUPERVISE_POLL:-10}"   # between "is the tmux session alive"
+RC_HEALTHY_AFTER="${RC_HEALTHY_AFTER:-30}"     # a run this long counts as "it worked"
+RC_MAX_DELAY="${RC_MAX_DELAY:-60}"             # ceiling for the failure backoff
 RC_LOG_MAX=$(( 8 * 1024 * 1024 ))
 # The person's own authorized_keys from their host account, bind-mounted
 # read-only. It is staged rather than mounted straight onto the path sshd reads
@@ -43,6 +45,12 @@ AKEYS_POLL="${AKEYS_POLL:-15}"
 AGENT_NAME="${AGENT_NAME:-${DEV_USER}}"
 AGENT_HOST="${AGENT_HOST:-$(hostname)}"
 AGENT_CLAUDE="${AGENT_CLAUDE:-0}"
+# same-dir (default): every session shares the working directory.
+# worktree:           each session gets its own git worktree — REQUIRES the working
+#                     directory to be a git repository.
+# session:            one session, capacity 1, exits when complete.
+AGENT_SPAWN="${AGENT_SPAWN:-same-dir}"
+AGENT_WORKDIR="${AGENT_WORKDIR:-${PROJECTS}}"
 
 log() { printf '[%s] supervisor: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 rc_log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"${RC_LOG}"; }
@@ -204,10 +212,32 @@ supervise_sshd() {
 # It runs inside tmux rather than as a bare background process so that a human
 # can `ssh` in and `tmux attach -t rc` to see the live TUI — including the
 # one-time "Enable Remote Control?" prompt.
-rc_loop() {
-    cd "${PROJECTS}" || { rc_log "FATAL: ${PROJECTS} is missing"; sleep 60; return 1; }
+# `--spawn worktree` is a hard error when the working directory is not a git
+# repository — Claude Code only falls back silently for a SAVED spawn mode, not
+# for an explicit flag. Without this check the loop would exit rc=1 every five
+# seconds forever.
+resolve_spawn() {
+    local want="${AGENT_SPAWN}"
+    case "${want}" in
+        same-dir|worktree|session) ;;
+        *)
+            rc_log "unknown spawn mode '${want}' — using same-dir (valid: same-dir, worktree, session)"
+            want=same-dir
+            ;;
+    esac
+    if [ "${want}" = worktree ] && ! git -C "${AGENT_WORKDIR}" rev-parse --git-dir >/dev/null 2>&1; then
+        rc_log "spawn mode 'worktree' needs ${AGENT_WORKDIR} to be a git repository, and it is not — using same-dir instead."
+        rc_log "  To get worktree mode, point this user at a repo: set 'workdir:' in users.yaml."
+        want=same-dir
+    fi
+    printf '%s' "${want}"
+}
 
-    local rc
+rc_loop() {
+    cd "${AGENT_WORKDIR}" || { rc_log "FATAL: ${AGENT_WORKDIR} is missing"; sleep 60; return 1; }
+
+    local rc spawn started elapsed delay="${RC_RESTART_DELAY}"
+    spawn=$(resolve_spawn)
     while :; do
         if [ -f "${RC_PAUSE}" ]; then
             rc_log "paused by 'portal setup'; re-checking in ${RC_AUTH_POLL}s"
@@ -227,17 +257,30 @@ rc_loop() {
             continue
         fi
 
-        rc_log "starting: claude remote-control --name ${AGENT_NAME}@${AGENT_HOST} --spawn worktree (cwd=${PWD})"
+        rc_log "starting: claude remote-control --name ${AGENT_NAME}@${AGENT_HOST} --spawn ${spawn} (cwd=${PWD})"
         # stdout/stderr split on purpose: stdout stays attached to the tmux pty
         # so the TUI renders and stays interactive, stderr is captured so a
         # crash leaves a trace in rc.log.
+        started=${SECONDS}
         claude remote-control \
             --name "${AGENT_NAME}@${AGENT_HOST}" \
-            --spawn worktree \
+            --spawn "${spawn}" \
             2>>"${RC_LOG}"
         rc=$?
-        rc_log "exited (rc=${rc}); restarting in ${RC_RESTART_DELAY}s"
-        sleep "${RC_RESTART_DELAY}"
+        elapsed=$(( SECONDS - started ))
+
+        # A network drop after a healthy run restarts promptly, as intended. A
+        # run that dies immediately is a misconfiguration, and hammering it
+        # every 5s just floods the log — back off instead.
+        if [ "${elapsed}" -lt "${RC_HEALTHY_AFTER}" ]; then
+            delay=$(( delay * 2 ))
+            [ "${delay}" -gt "${RC_MAX_DELAY}" ] && delay="${RC_MAX_DELAY}"
+            rc_log "exited after ${elapsed}s (rc=${rc}) — looks like a misconfiguration; retrying in ${delay}s"
+        else
+            delay="${RC_RESTART_DELAY}"
+            rc_log "exited after ${elapsed}s (rc=${rc}); restarting in ${delay}s"
+        fi
+        sleep "${delay}"
     done
 }
 
@@ -249,7 +292,7 @@ supervise_rc() {
         fi
         if ! as_dev "tmux has-session -t ${RC_SESSION}" >/dev/null 2>&1; then
             log "creating tmux session '${RC_SESSION}'"
-            as_dev "tmux new-session -d -s ${RC_SESSION} -c ${PROJECTS} '/usr/local/bin/supervisor.sh rc-loop'" \
+            as_dev "tmux new-session -d -s ${RC_SESSION} -c ${AGENT_WORKDIR} '/usr/local/bin/supervisor.sh rc-loop'" \
                 || log "WARNING: could not create tmux session '${RC_SESSION}'"
         fi
         sleep "${RC_SUPERVISE_POLL}"

@@ -34,6 +34,15 @@ users:
     port: 2201
     # Run the supervised `claude remote-control` loop in this container.
     claude: true
+    # How Remote Control creates sessions:
+    #   same-dir  (default) every session shares workdir
+    #   worktree            each session gets its own git worktree — REQUIRES
+    #                       workdir to be a git repository
+    #   session             a single session, capacity 1, exits when complete
+    spawn: same-dir
+    # Where the server runs. /home/dev/projects holds repos but is not itself
+    # one, so point workdir at a repo if you want spawn: worktree.
+    workdir: /home/dev/projects
     # Allow the Codex desktop app to connect over SSH. Needs no extra process:
     # the app spawns `codex app-server` itself through the login shell.
     codex: true

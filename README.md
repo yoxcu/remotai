@@ -5,7 +5,7 @@ A multi-user AI-agent host: one Docker container per person, each signed in with
 
 - **Claude Code Remote Control** runs supervised inside each container, so the
   person's sessions show up in claude.ai/code and the Claude apps without any
-  inbound port.
+  inbound port. Spawn mode is per-user (`same-dir`, `worktree`, `session`).
 - **Codex** needs nothing but SSH: the desktop app spawns `codex app-server`
   itself on the far side.
 - Logins, config and SSH keys live in a per-user named volume, so rebuilding the

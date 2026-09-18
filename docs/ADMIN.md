@@ -165,6 +165,33 @@ whatever sessions were running. They come back, but the work in flight does not.
 
 ---
 
+## Spawn modes
+
+`claude remote-control --spawn <mode>` decides how each new session gets a
+working tree:
+
+| mode | behaviour |
+|---|---|
+| `same-dir` | **default.** Every session shares `workdir`. Right for `/home/dev/projects`, which holds repos but is not one. |
+| `worktree` | Each session gets its own git worktree. **`workdir` must be a git repository** or Claude Code exits immediately. |
+| `session` | One session, capacity 1, exits when complete. |
+
+Claude Code falls back to `same-dir` on its own only for a *saved* spawn mode;
+an explicit `--spawn worktree` against a non-repo is a hard error. `supervisor.sh`
+therefore checks `git rev-parse` first and falls back with a line in `rc.log`
+rather than exiting every few seconds.
+
+To give someone real worktree isolation, point them at a repo:
+
+```sh
+./portal add alice --claude --spawn worktree --workdir /home/dev/projects/monorepo
+```
+
+Or for an existing user, set `spawn:` and `workdir:` in `users.yaml` and run
+`./portal update`.
+
+---
+
 ## Rotating and revoking keys
 
 **A key the person controls.** Nothing to run: Alice edits
@@ -363,6 +390,7 @@ environment variable it had to strip.
 | A new key on the host does not work | It syncs within ~15s **if the file was edited in place**. An editor that replaces the file gets a new inode, which the bind mount does not follow: `docker restart work-alice`. `ssh-copy-id` and `>>` append in place and are fine. |
 | Session missing from claude.ai/code | `./portal status`; then `docker exec -it work-alice su -l dev -c 'tail -40 ~/rc.log'` |
 | rc loop says "not signed in" | `./portal setup alice` |
+| `Worktree mode requires a git repository` in rc.log | `spawn: worktree` with a `workdir` that is not a repo. Set `spawn: same-dir`, or point `workdir` at a repo. Newer containers fall back automatically and say so. |
 | Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/bin/codex` |
 | `codex login --device-auth` refused by the workspace | Use the SSH tunnel: `ssh -L 1455:localhost:1455 -p 22NN dev@host`, then `codex login` in that session. |
 | Host key changed for everyone after an update | Should not happen — keys live in the home volume. If it did, the volume was recreated. |

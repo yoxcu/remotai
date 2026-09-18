@@ -19,9 +19,14 @@ Once the server is running, the same session appears in all of these:
 | **Claude desktop app** | Same list, under Code. |
 | **Claude mobile app** | Same list. Handy for kicking something off and checking back. |
 
-Pick it and start a session. Each new session gets its **own git worktree**, so
-two of your sessions never fight over the same working tree. Your repos live in
-`~/projects` inside the container.
+Pick it and start a session. Your repos live in `~/projects` inside the
+container.
+
+By default every session shares that directory (`same-dir`). If you would rather
+each session got its **own git worktree**, so two sessions never fight over the
+same working tree, ask your admin to set `spawn: worktree` and point `workdir`
+at one of your repos — worktree mode needs the server to run *inside* a git
+repository, and `~/projects` is a folder of repos rather than a repo itself.
 
 If the entry is missing, it is nearly always one of:
 

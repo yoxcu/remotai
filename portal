@@ -63,6 +63,11 @@ DEFAULT_SRV_ROOT = "/srv/agents"
 PORT_BASE = 2201
 PORT_CEILING = 2299
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
+# `claude remote-control --spawn <mode>`: same-dir, worktree, session.
+# worktree is a hard error unless the working directory is a git repository, so
+# same-dir (Claude Code's own default) is ours too.
+SPAWN_MODES = ("same-dir", "worktree", "session")
+DEFAULT_WORKDIR = "/home/dev/projects"
 KEY_RE = re.compile(r"^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-ssh-ed25519@\S+|sk-ecdsa-sha2-\S+)\s+\S+")
 
 BANNED_ENV = (
@@ -127,6 +132,11 @@ def load_config(required: bool = True) -> dict:
     for user in cfg["users"]:
         user.setdefault("claude", False)
         user.setdefault("codex", False)
+        user.setdefault("spawn", "same-dir")
+        user.setdefault("workdir", DEFAULT_WORKDIR)
+        if user["spawn"] not in SPAWN_MODES:
+            die(f"user '{user['name']}' has spawn: {user['spawn']!r}; "
+                f"valid modes are {', '.join(SPAWN_MODES)}")
         user.setdefault("extra_keys", [])
         if user.get("keys"):
             die(f"user '{user['name']}' still has a 'keys:' block, which no "
@@ -422,6 +432,8 @@ def render(cfg: dict, quiet: bool = False) -> None:
                 "AGENT_HOST": host,
                 "AGENT_CLAUDE": "1" if user["claude"] else "0",
                 "AGENT_CODEX": "1" if user["codex"] else "0",
+                "AGENT_SPAWN": user.get("spawn", "same-dir"),
+                "AGENT_WORKDIR": user.get("workdir", DEFAULT_WORKDIR),
             },
             "ports": [f"0.0.0.0:{port}:22"],
             "volumes": mounts,
@@ -514,6 +526,13 @@ def cmd_add(args: argparse.Namespace) -> None:
              f"Edit {USERS_YAML.name} and run './portal update' to change that.")
 
     entry = {"name": name, "port": port, "claude": claude, "codex": codex}
+    if claude:
+        entry["spawn"] = args.spawn
+        entry["workdir"] = args.workdir
+        if args.spawn == "worktree" and args.workdir == DEFAULT_WORKDIR:
+            warn(f"--spawn worktree needs {DEFAULT_WORKDIR} to be a git repository. "
+                 "It is not, so the container will fall back to same-dir. Pass "
+                 "--workdir /home/dev/projects/<repo> to get real worktree mode.")
     if akeys:
         entry["authorized_keys"] = akeys
     if extra:
@@ -712,7 +731,8 @@ def _probe(name: str, state: str, quick: bool) -> dict:
 
 def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
     host = agent_host(cfg)
-    hdr = f"{'NAME':<14}{'PORT':<7}{'STATE':<11}{'CLAUDE':<10}{'CODEX':<10}{'RC LOOP':<9}"
+    hdr = (f"{'NAME':<14}{'PORT':<7}{'STATE':<11}{'CLAUDE':<10}{'CODEX':<10}"
+           f"{'RC LOOP':<9}{'SPAWN':<10}")
     print(_c("1", hdr))
     rows = []
     for user in users:
@@ -724,8 +744,9 @@ def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
         if not user["codex"]:
             row["codex"] = "off"
         rows.append((user, row))
+        spawn = user.get("spawn", "same-dir") if user["claude"] else "-"
         print(f"{name:<14}{user['port']:<7}{row['state']:<11}"
-              f"{row['claude']:<10}{row['codex']:<10}{row['rc']:<9}")
+              f"{row['claude']:<10}{row['codex']:<10}{row['rc']:<9}{spawn:<10}")
     for user, row in rows:
         print(f"  {_c('2', user['name'] + ' keys:   ' + describe_key_sources(user))}")
     for user, row in rows:
@@ -829,6 +850,12 @@ def main() -> None:
     p.add_argument("--claude", action="store_true", help="run the supervised remote-control loop")
     p.add_argument("--codex", action="store_true", help="allow the Codex desktop app over SSH")
     p.add_argument("--port", type=int, help="host sshd port (default: next free from 2201)")
+    p.add_argument("--spawn", choices=SPAWN_MODES, default="same-dir",
+                   help="how Remote Control creates sessions (default: same-dir; "
+                        "worktree requires --workdir to be a git repository)")
+    p.add_argument("--workdir", default=DEFAULT_WORKDIR, metavar="DIR",
+                   help=f"working directory for the Remote Control server "
+                        f"(default: {DEFAULT_WORKDIR})")
     p.set_defaults(func=cmd_add)
 
     p = add_parser("setup", help="one-time interactive logins (needs a TTY)")

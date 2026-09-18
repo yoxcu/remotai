@@ -1,0 +1,44 @@
+# sshd for a work container. Key-only, one account, no root.
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+# Host keys live in the per-user home volume, NOT in the image. `portal update`
+# recreates every container from a fresh image; if the keys lived in /etc/ssh
+# they would change on each update and every user would get a
+# REMOTE HOST IDENTIFICATION HAS CHANGED wall of text. supervisor.sh generates
+# them on first boot and they persist from then on.
+HostKey /home/dev/.ssh/host_keys/ssh_host_ed25519_key
+HostKey /home/dev/.ssh/host_keys/ssh_host_rsa_key
+
+PermitRootLogin no
+AllowUsers dev
+
+PubkeyAuthentication yes
+# Rendered on the host from users.yaml and bind-mounted read-only, so a user
+# cannot add keys to their own container.
+AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u
+
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+GSSAPIAuthentication no
+HostbasedAuthentication no
+UsePAM yes
+
+X11Forwarding no
+AllowTcpForwarding yes
+PermitTunnel no
+PrintMotd no
+AcceptEnv LANG LC_*
+
+# The Codex desktop app holds a long-lived app-server connection; keep it alive
+# through NAT and idle periods, and reap it if the client vanishes.
+ClientAliveInterval 30
+ClientAliveCountMax 6
+TCPKeepAlive yes
+
+Subsystem sftp /usr/lib/openssh/sftp-server

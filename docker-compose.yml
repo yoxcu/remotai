@@ -1,0 +1,23 @@
+# Base stack: builds the shared image. The per-person work containers live in
+# compose.users.yml, which `portal` renders from users.yaml.
+#
+# Always use both files together:
+#   docker compose -f docker-compose.yml -f compose.users.yml <cmd>
+# or just let `./portal` do it.
+name: agents
+
+services:
+  # Build-only. Behind a profile so `up` never tries to start it.
+  agent-base:
+    image: agent-base:latest
+    profiles: ["build"]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.agent-base
+      args:
+        # Match the host user that owns /srv/agents, so bind-mounted projects
+        # are writable from both sides without any chown dance.
+        DEV_UID: "${DEV_UID:-1000}"
+        DEV_GID: "${DEV_GID:-1000}"
+        # Bumped by `portal update` to force a fresh npm pull of claude+codex.
+        REFRESH: "${REFRESH:-0}"

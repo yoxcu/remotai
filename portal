@@ -14,7 +14,8 @@ Either may be omitted, but not both.
     ./portal add <name> [--key <pubkey|path>]... [--claude] [--codex]
     ./portal setup <name>       one-time interactive logins (needs a TTY)
     ./portal pair <name>        fresh Codex pairing code for a phone
-    ./portal status [-q]
+    ./portal status [-q]        every user, one line each
+    ./portal status <name>      one user in depth, with a diagnosis
     ./portal update             rebuild the image, recreate containers
     ./portal rm <name> [--purge]
     ./portal render             re-render compose.users.yml + authorized_keys
@@ -29,12 +30,15 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import pwd
 import socket
 import subprocess
 import sys
+import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 try:
@@ -374,6 +378,25 @@ def user_dirs(cfg: dict, name: str) -> tuple[Path, Path, Path]:
     return base, base / "projects", base / "ssh"
 
 
+def agent_env(host: str, user: dict) -> dict[str, str]:
+    """The AGENT_* environment a user's container is started with.
+
+    `status <name>` compares this against the container's /run/agent.env to
+    spot a users.yaml edit that was never applied.
+    """
+    return {
+        "AGENT_NAME": user["name"],
+        "AGENT_HOST": host,
+        "AGENT_CLAUDE": "1" if user["claude"] else "0",
+        "AGENT_CODEX": "1" if user["codex"] else "0",
+        "AGENT_SPAWN": user.get("spawn", "same-dir"),
+        "AGENT_WORKDIR": user.get("workdir", DEFAULT_WORKDIR),
+        # Empty means "do not pass the flag at all".
+        "AGENT_PERMISSION_MODE": user.get("permission_mode") or "",
+        "AGENT_SANDBOX_MODE": user.get("sandbox_mode") or "",
+    }
+
+
 def render(cfg: dict, quiet: bool = False) -> None:
     uid, gid = build_uid_gid(cfg)
     host = agent_host(cfg)
@@ -453,17 +476,7 @@ def render(cfg: dict, quiet: bool = False) -> None:
             "hostname": name,
             "restart": "unless-stopped",
             "stop_grace_period": "20s",
-            "environment": {
-                "AGENT_NAME": name,
-                "AGENT_HOST": host,
-                "AGENT_CLAUDE": "1" if user["claude"] else "0",
-                "AGENT_CODEX": "1" if user["codex"] else "0",
-                "AGENT_SPAWN": user.get("spawn", "same-dir"),
-                "AGENT_WORKDIR": user.get("workdir", DEFAULT_WORKDIR),
-                # Empty means "do not pass the flag at all".
-                "AGENT_PERMISSION_MODE": user.get("permission_mode") or "",
-                "AGENT_SANDBOX_MODE": user.get("sandbox_mode") or "",
-            },
+            "environment": agent_env(host, user),
             "ports": [f"0.0.0.0:{port}:22"],
             "volumes": mounts,
         }
@@ -864,6 +877,69 @@ def cmd_pair(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+_MARK = "@@portal@@"
+
+
+def _gather(name: str, probes: dict[str, str]) -> dict[str, tuple[int, str]]:
+    """Run several read-only probes in ONE `docker exec`: {key: (rc, output)}.
+
+    Every exec is a fresh login shell, which costs more than most probes do, so
+    batching is what keeps `status <name>` quick. Output is merged stdout+stderr.
+    """
+    script = "".join(f"{{ {cmd}\n}} 2>&1; printf '\\n{_MARK} %s %s\\n' {key} $?\n"
+                     for key, cmd in probes.items())
+    out: dict[str, tuple[int, str]] = {}
+    buf: list[str] = []
+    for line in (exec_in(name, script).stdout or "").split("\n"):
+        if line.startswith(_MARK + " "):
+            _, key, rc = line.split(" ", 2)
+            text = "\n".join(buf)
+            out[key] = (int(rc), text[:-1] if text.endswith("\n") else text)
+            buf = []
+        else:
+            buf.append(line)
+    return {key: out.get(key, (-1, "")) for key in probes}
+
+
+# The daemon's own bookkeeping. `daemon version` only asks whatever answers on
+# the control socket, so "running" there does not mean the daemon still tracks
+# that app-server — and when it does not, `remote-control start` refuses and
+# nothing ever restarts it. A pid file naming a live process is what "tracked"
+# means here.
+_PIDFILE_SH = (
+    'pidfile() { f="$HOME/.codex/app-server-daemon/$1.pid"; '
+    '[ -e "$f" ] || { echo missing; return; }; '
+    "p=$(grep -o '[0-9]\\+' \"$f\" | head -n1); "
+    'if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "alive $p"; '
+    'else echo "dead ${p:-?}"; fi; }; ')
+
+CODEX_DAEMON_PROBES = {
+    # stderr dropped: these two are parsed as JSON, and a warning would break that.
+    "daemon": "codex app-server daemon version 2>/dev/null",
+    "settings": "cat ~/.codex/app-server-daemon/settings.json 2>/dev/null",
+    "pidfile": _PIDFILE_SH + "pidfile app-server",
+}
+
+
+def _classify_daemon(probe: dict[str, tuple[int, str]]) -> str:
+    """up / no-rc / orphan / down, from the CODEX_DAEMON_PROBES results."""
+    try:
+        running = json.loads(probe["daemon"][1].strip()).get("status") == "running"
+    except (ValueError, TypeError, AttributeError):
+        running = False
+    if not running:
+        return "down"
+    if not probe["pidfile"][1].startswith("alive"):
+        return "orphan"
+    # A daemon can be up for the desktop app while remote control is off, and
+    # then no phone can see it — worth telling those two apart.
+    try:
+        enabled = json.loads(probe["settings"][1].strip()).get("remoteControlEnabled")
+    except (ValueError, TypeError, AttributeError):
+        enabled = False
+    return "up" if enabled else "no-rc"
+
+
 def _codex_daemon(name: str) -> str:
     """Read-only view of the Codex app-server daemon.
 
@@ -871,21 +947,7 @@ def _codex_daemon(name: str) -> str:
     effect of being asked whether one is running, which is not what `status`
     should do. `daemon version` only talks to an existing control socket.
     """
-    res = exec_in(name, "codex app-server daemon version 2>/dev/null")
-    try:
-        running = json.loads((res.stdout or "").strip()).get("status") == "running"
-    except (ValueError, TypeError):
-        running = False
-    if not running:
-        return "down"
-    # A daemon can be up for the desktop app while remote control is off, and
-    # then no phone can see it — worth telling those two apart.
-    res = exec_in(name, "cat ~/.codex/app-server-daemon/settings.json 2>/dev/null")
-    try:
-        enabled = json.loads((res.stdout or "").strip()).get("remoteControlEnabled")
-    except (ValueError, TypeError):
-        enabled = False
-    return "up" if enabled else "no-rc"
+    return _classify_daemon(_gather(name, CODEX_DAEMON_PROBES))
 
 
 def _probe(user: dict, state: str, quick: bool) -> dict:
@@ -964,8 +1026,273 @@ def _print_status_rows(cfg: dict, users: list[dict], quick: bool) -> None:
     print(_c("2", "pair a phone with Codex: ./portal pair <name>"))
 
 
+# ---------------------------------------------------------------------------
+# status <name>: one user, in depth
+# ---------------------------------------------------------------------------
+
+# Outbound HTTPS from INSIDE the container, through the same login shell the
+# agents run in. Any HTTP status at all means the way out works; only a curl
+# error means it does not. Worth having because a host that loses Docker's NAT
+# rules — `systemctl restart iptables` does it — shows every symptom as an agent
+# problem: "connecting" forever, logins failing, model refreshes timing out.
+NET_TARGETS = {"claude": "api.anthropic.com", "codex": "chatgpt.com"}
+NET_TIMEOUT = 10
+
+
+def _net_probe(name: str, host: str) -> tuple[bool, str]:
+    res = exec_in(name, f"curl -s -m {NET_TIMEOUT} -o /dev/null -w '%{{http_code}} "
+                        f"%{{time_total}} %{{exitcode}} %{{errormsg}}' https://{host}/")
+    parts = (res.stdout or "").strip().split(" ", 3)
+    if len(parts) < 3:
+        return False, (res.stdout or res.stderr or "no output from curl").strip()
+    code, secs, rc = parts[:3]
+    if rc != "0":
+        return False, f"curl exit {rc}: {parts[3] if len(parts) > 3 else ''}".strip()
+    return True, f"HTTP {code} in {float(secs):.2f}s"
+
+
+def _kv(key: str, text: str, dim: bool = False, width: int = 13) -> None:
+    lines = text.splitlines() or [""]
+    for i, line in enumerate(lines):
+        print(f"  {key if i == 0 else '':<{width}}" + (_c("2", line) if dim else line))
+
+
+def _parse_agent_env(text: str) -> dict[str, str]:
+    """/run/agent.env is `KEY=<printf %q value>` lines."""
+    env = {}
+    for line in text.splitlines():
+        key, sep, raw = line.partition("=")
+        if sep and key.startswith("AGENT_"):
+            try:
+                words = shlex.split(raw)
+            except ValueError:
+                words = [raw]
+            env[key] = words[0] if words else ""
+    return env
+
+
+def _pid_role(args: str) -> str:
+    if "--managed-daemon" in args:
+        return "daemon's app-server"
+    if "pid-update-loop" in args:
+        return "daemon's updater"
+    if " app-server" in args:
+        return "desktop app (over SSH)"
+    return ""
+
+
+def _status_detail(cfg: dict, user: dict) -> None:
+    """Everything `status` knows about one user, plus what it concludes.
+
+    Read-only, like the table: nothing here starts, stops or re-pairs anything.
+    """
+    name = user["name"]
+    findings: list[str] = []
+    print(_c("1", f"work-{name}") + _c("2", f"   ssh -p {user['port']} dev@{agent_host(cfg)}"))
+
+    print("\n" + _c("1", "container"))
+    try:
+        info_ = json.loads(docker(["inspect", f"work-{name}"]).stdout)[0]
+    except (ValueError, IndexError, TypeError):
+        _kv("state", "absent")
+        findings.append(f"work-{name} does not exist. './portal update' creates it.")
+        _print_findings(findings)
+        return
+    state = info_["State"]["Status"]
+    started = info_["State"].get("StartedAt", "")[:19].replace("T", " ")
+    _kv("state", f"{state} since {started} UTC, {info_.get('RestartCount', 0)} restart(s)")
+    current = docker(["image", "inspect", "-f", "{{.Id}}", IMAGE]).stdout.strip()
+    if current and info_.get("Image") != current:
+        _kv("image", f"older than {IMAGE}")
+        findings.append(
+            f"work-{name} runs an older image than {IMAGE}, so it lacks the current "
+            "supervisor.sh and agent versions. './portal update' recreates it — which "
+            "restarts it, so pick a moment when nothing long-running is in there.")
+    else:
+        _kv("image", f"current ({IMAGE})")
+    _kv("keys", describe_key_sources(user))
+    if state != "running":
+        logs = docker(["logs", "--tail", "15", f"work-{name}"])
+        _kv("docker logs", ((logs.stdout or "") + (logs.stderr or "")).strip(), dim=True)
+        findings.append(f"work-{name} is {state}. 'docker logs work-{name}' says why; "
+                        "'./portal update' brings it back.")
+        _print_findings(findings)
+        return
+
+    probes = {
+        "env": "cat /run/agent.env",
+        "cpus": "nproc",
+        "load": "cut -d' ' -f1-3 /proc/loadavg",
+        "mem": "free -m | awk '/^Mem:/{print $2, $7}'",
+        "pids": "cat /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids.max",
+    }
+    if user["claude"]:
+        probes |= {
+            "claude_auth": "claude auth status",
+            "claude_loop": "tmux has-session -t rc",
+            "rc_log": "tail -n 8 ~/rc.log",
+        }
+    if user["codex"]:
+        probes |= CODEX_DAEMON_PROBES | {
+            "codex_login": "codex login status",
+            "standalone": ('l=~/.codex/packages/standalone; if [ -L "$l" ]; then readlink "$l"; '
+                           'elif [ -e "$l" ]; then echo "a real directory, not a link"; false; '
+                           'else echo missing; false; fi'),
+            "updater": _PIDFILE_SH + "pidfile app-server-updater",
+            "procs": "ps -u dev -o pid=,ppid=,etime=,args=",
+            "codex_log": "tail -n 8 ~/codex.log",
+            "stderr": "tail -n 5 ~/.codex/app-server-daemon/app-server.stderr.log",
+        }
+    targets = [NET_TARGETS[agent] for agent in ("claude", "codex") if user[agent]]
+    # The probes and the network checks run side by side: a dead network makes
+    # each curl take the full timeout, and nobody should wait for that twice.
+    with ThreadPoolExecutor() as pool:
+        gathered = pool.submit(_gather, name, probes)
+        nets = {host: pool.submit(_net_probe, name, host) for host in targets}
+        probe = gathered.result()
+        net = {host: fut.result() for host, fut in nets.items()}
+
+    live = _parse_agent_env(probe["env"][1]) if probe["env"][0] == 0 else {}
+    _kv("config", "  ".join(f"{k[6:].lower()}={v or '-'}" for k, v in live.items()
+                            if k not in ("AGENT_NAME", "AGENT_HOST")) or "no /run/agent.env")
+    drift = [f"{k[6:].lower()}: running {live.get(k) or '-'}, {USERS_YAML.name} says {v or '-'}"
+             for k, v in agent_env(agent_host(cfg), user).items() if live and live.get(k, "") != v]
+    if drift:
+        _kv("  drift", "\n".join(drift))
+        findings.append(f"{USERS_YAML.name} was changed after work-{name} started, and the "
+                        "container still runs the old settings. './portal update' applies them.")
+
+    print("\n" + _c("1", "resources"))
+    try:
+        cpus = int(probe["cpus"][1])
+        load1 = float(probe["load"][1].split()[0])
+        _kv("cpu", f"{cpus} cpus, load {probe['load'][1]}")
+        if load1 > cpus:
+            findings.append(f"load {load1:g} exceeds the {cpus} CPUs the container sees; "
+                            "short-lived agent helpers can miss their timeouts.")
+    except (ValueError, IndexError):
+        _kv("cpu", probe["cpus"][1] or "?")
+    try:
+        total, avail = (int(x) for x in probe["mem"][1].split())
+        _kv("memory", f"{avail} MiB available of {total} MiB")
+        if avail < total * 0.05:
+            findings.append(f"only {avail} MiB of memory left in work-{name}.")
+    except ValueError:
+        _kv("memory", probe["mem"][1] or "?")
+    pids = probe["pids"][1].split()
+    _kv("pids", " of ".join(pids) if pids else "?")
+    if len(pids) == 2 and pids[1].isdigit() and int(pids[0]) > 0.9 * int(pids[1]):
+        findings.append(f"work-{name} is close to its process limit ({pids[0]} of {pids[1]}).")
+
+    if targets:
+        print("\n" + _c("1", "network") + _c("2", "   outbound HTTPS from inside the container"))
+        for host in targets:
+            ok, text = net[host]
+            _kv(host, (_c("32", "ok   ") if ok else _c("31", "FAIL ")) + text,
+                width=max(13, max(map(len, targets)) + 2))
+        failed = [host for host in targets if not net[host][0]]
+        if failed:
+            findings.append(
+                f"work-{name} cannot reach {', '.join(failed)} over HTTPS, so nothing that "
+                "needs the account works — remote control, logins, model calls — however "
+                f"healthy the rest looks. Run 'curl -m 10 -I https://{failed[0]}/' on the "
+                "host: if the host gets out and the container does not, Docker's NAT rules "
+                "are gone, usually after "
+                "'systemctl restart iptables' or a firewall reload; see \"Host firewall\" "
+                "in docs/ADMIN.md.")
+
+    if user["claude"]:
+        print("\n" + _c("1", "claude"))
+        rc, out = probe["claude_auth"]
+        try:
+            login = (json.loads(out).get("authMethod") or "ok") if rc == 0 else "NO LOGIN"
+        except (ValueError, AttributeError):
+            login = "ok"
+        _kv("login", login)
+        loop_up = probe["claude_loop"][0] == 0
+        _kv("loop", "up (tmux session rc)" if loop_up else "down")
+        _kv("rc.log", probe["rc_log"][1] or "(empty)", dim=True)
+        if login == "NO LOGIN":
+            findings.append(f"Claude is not signed in. './portal setup {name}' (needs the person).")
+        if not loop_up:
+            findings.append("the rc tmux session is gone; the supervisor restarts it within "
+                            f"seconds. If it stays gone, 'docker logs work-{name}' says why.")
+
+    if user["codex"]:
+        print("\n" + _c("1", "codex"))
+        rc, out = probe["codex_login"]
+        _kv("login", out.splitlines()[0] if rc == 0 and out else "NO LOGIN")
+        if rc != 0:
+            findings.append(f"Codex is not signed in. './portal setup {name}' (needs the person).")
+        rc, out = probe["standalone"]
+        _kv("install", f"~/.codex/packages/standalone -> {out}" if rc == 0
+            else f"~/.codex/packages/standalone is {out}")
+        if rc != 0 or not out.startswith("/opt/codex/"):
+            findings.append("~/.codex/packages/standalone does not point at the image's shared "
+                            "install. The supervisor links it at boot unless a real directory is "
+                            "in the way; ~/codex.log says which.")
+        daemon = _classify_daemon(probe)
+        try:
+            version = json.loads(probe["daemon"][1]).get("managedCodexVersion") or ""
+        except (ValueError, AttributeError):
+            version = ""
+        _kv("daemon", daemon + (f" ({version})" if version else ""))
+        _kv("pid files", f"app-server: {probe['pidfile'][1]}\nupdater:    {probe['updater'][1]}")
+        procs = []
+        for line in probe["procs"][1].splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and os.path.basename(parts[3].split()[0]).startswith("codex"):
+                procs.append(parts)
+        _kv("processes", "\n".join(
+            f"{pid:>7} {etime:>12}  {_pid_role(args) or os.path.basename(args.split()[0])}"
+            for pid, _, etime, args in procs) or "none")
+        _kv("codex.log", probe["codex_log"][1] or "(empty)", dim=True)
+        _kv("stderr log", probe["stderr"][1] or "(empty)", dim=True)
+
+        if daemon == "orphan":
+            daemon_pids = {pid for pid, _, _, args in procs
+                           if "--managed-daemon" in args or "pid-update-loop" in args}
+            stray = " ".join(pid for pid, ppid, _, _ in procs
+                             if pid in daemon_pids or ppid in daemon_pids)
+            findings.append(
+                "the Codex daemon has lost track of its own app-server (pid file: "
+                f"{probe['pidfile'][1]}). 'remote-control start' refuses from then on and "
+                "nothing restarts that app-server, so once its connection drops the phone "
+                "loses the container. A current supervisor.sh recovers from this on its next "
+                "poll; on an older image, stop the daemon's processes and it starts clean "
+                f"within a minute: docker exec work-{name} kill {stray or '<pids above>'}")
+        elif daemon == "down":
+            findings.append("no Codex daemon is running. The supervisor tries once a minute; "
+                            "if it stays down, ~/codex.log says why.")
+        elif daemon == "no-rc":
+            findings.append("the Codex daemon runs with remote control off, so no phone can see "
+                            "it. The supervisor turns it back on at its next poll.")
+        last = (probe["codex_log"][1].splitlines() or [""])[-1]
+        if "Error" in last and daemon != "orphan":   # orphan already explains its error
+            findings.append(f"the latest state in ~/codex.log is an error: {last.split('] ', 1)[-1]}")
+
+    _print_findings(findings)
+
+
+def _print_findings(findings: list[str]) -> None:
+    print("\n" + _c("1", "findings"))
+    if not findings:
+        print("  " + _c("32", "nothing wrong that these probes can see"))
+        return
+    for text in findings:
+        lines = textwrap.wrap(text, width=76, break_on_hyphens=False)
+        print("  " + _c("31", "!") + " " + lines[0])
+        for line in lines[1:]:
+            print("    " + line)
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     cfg = load_config()
+    if getattr(args, "name", None):
+        if args.quick:
+            die("-q skips the in-container probes, which is all 'status <name>' is")
+        _status_detail(cfg, find_user(cfg, args.name))
+        return
     if not cfg["users"]:
         info("no users yet — ./portal add <name> --claude")
         return
@@ -1085,7 +1412,11 @@ def main() -> None:
     p.add_argument("name")
     p.set_defaults(func=cmd_pair)
 
-    p = add_parser("status", help="show every container and its login state")
+    p = add_parser("status", help="show every container and its login state, "
+                                  "or one user's in depth")
+    p.add_argument("name", nargs="?",
+                   help="report on this user alone, in depth: container, config, "
+                        "resources, outbound network, both agents, and a diagnosis")
     p.add_argument("-q", "--quick", action="store_true",
                    help="skip the in-container probes (much faster)")
     p.set_defaults(func=cmd_status)

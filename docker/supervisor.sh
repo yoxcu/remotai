@@ -452,6 +452,79 @@ resolve_sandbox_arg() {
     printf " -c 'sandbox_mode=\"%s\"'" "${AGENT_SANDBOX_MODE}"
 }
 
+# One poll: the daemon's state as a single line — the `status` field of
+# `remote-control start --json` on success, the first line of its error
+# otherwise.
+codex_rc_state() {
+    local sandbox_arg=$1 out state
+    if ! as_dev "codex login status" >/dev/null 2>&1; then
+        echo "not signed in to a ChatGPT account — run 'portal setup ${AGENT_NAME}' on the host"
+        return
+    fi
+    # Bounded: `start` has its own internal timeout, but if it ever blocked, an
+    # unbounded call here would wedge this loop with no further log lines and
+    # nothing to notice it by.
+    out=$(as_dev "timeout ${CODEX_START_TIMEOUT} codex remote-control start${sandbox_arg} --json 2>&1")
+    # On success this is one JSON object; on failure it is an `Error:` line, and
+    # jq gives us nothing to match on.
+    state=$(printf '%s\n' "${out}" | jq -r '.status' 2>/dev/null | grep -m1 -v '^null$')
+    if [ -z "${state}" ]; then
+        state=$(printf '%s\n' "${out}" | grep -m1 . | cut -c1-200)
+        [ -n "${state}" ] || state="no output from 'codex remote-control start'"
+    fi
+    echo "${state}"
+}
+
+# Seen in production: the daemon's pid files in ~/.codex/app-server-daemon/
+# vanished while the app-server it had started kept running. From then on every
+# `remote-control start` fails with this error, nothing ever restarts that
+# app-server, and once its connection dropped the phone lost the container for
+# good — the log said "connected" one day and this error for the next two. What
+# removed the pid files is not known, so this treats the symptom.
+CODEX_UNTRACKED="not managed by codex app-server daemon"
+# The daemon's OWN processes: the app-server it launches with --managed-daemon,
+# and its updater loop. An app-server the desktop app spawned over SSH carries
+# neither, so it is never matched. Anchored to the executable so a shell or grep
+# whose command line merely mentions these words is not matched either.
+CODEX_DAEMON_PROCS='^[^ ]*codex app-server (.* )?--managed-daemon|^[^ ]*codex app-server daemon pid-update-loop'
+
+# Stop the daemon's untracked processes so the next `start` brings up a fresh,
+# tracked pair. Children go too: the app-server runs helpers (codex-code-mode-
+# host) that would otherwise be orphaned onto tini.
+reap_untracked_codex() {
+    local pids="" pid child
+    for pid in $(pgrep -u "${DEV_USER}" -f "${CODEX_DAEMON_PROCS}"); do
+        pids+=" ${pid}"
+        for child in $(pgrep -P "${pid}"); do pids+=" ${child}"; done
+    done
+    if [ -z "${pids}" ]; then
+        codex_log "recovery: no daemon-owned codex process to stop; leaving it to the next poll"
+        return 1
+    fi
+    codex_log "recovery: the daemon lost track of its app-server; stopping pids${pids}"
+    # shellcheck disable=SC2086  # word-splitting the pid list is the point
+    kill -TERM ${pids} 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        # shellcheck disable=SC2086
+        any_alive ${pids} || return 0
+        sleep 1
+    done
+    # shellcheck disable=SC2086
+    kill -KILL ${pids} 2>/dev/null
+    return 0
+}
+
+# `kill -0 a b c` fails as soon as ANY of them is gone; this asks the opposite.
+# A zombie has exited, just not been reaped yet, so it counts as gone.
+any_alive() {
+    local pid st
+    for pid in "$@"; do
+        st=$(ps -o stat= -p "${pid}" 2>/dev/null) || continue
+        [[ "${st}" == Z* ]] || return 0
+    done
+    return 1
+}
+
 # `codex remote-control start` starts a detached, pid-backed daemon and returns,
 # so there is no process to hold open and nothing to attach to — polling it is
 # the whole supervision story. It is idempotent ("alreadyRunning") and it also
@@ -461,7 +534,7 @@ resolve_sandbox_arg() {
 # Only state CHANGES are logged. At one poll a minute, logging every "connected"
 # would bury the one line that matters.
 codex_loop() {
-    local out state last="" sandbox_arg
+    local state last="" sandbox_arg
     sandbox_arg=$(resolve_sandbox_arg)
     # Logged in full, once, for the same reason rc.log logs its `starting:`
     # line: env vars alone never prove what the process was actually given.
@@ -483,20 +556,16 @@ codex_loop() {
             last=""
         fi
 
-        if ! as_dev "codex login status" >/dev/null 2>&1; then
-            state="not signed in to a ChatGPT account — run 'portal setup ${AGENT_NAME}' on the host"
-        else
-            # Bounded: `start` has its own internal timeout, but if it ever
-            # blocked, an unbounded call here would wedge this loop with no
-            # further log lines and nothing to notice it by.
-            out=$(as_dev "timeout ${CODEX_START_TIMEOUT} codex remote-control start${sandbox_arg} --json 2>&1")
-            # On success this is one JSON object; on failure it is an `Error:`
-            # line, and jq gives us nothing to match on.
-            state=$(printf '%s\n' "${out}" | jq -r '.status' 2>/dev/null | grep -m1 -v '^null$')
-            if [ -z "${state}" ]; then
-                state=$(printf '%s\n' "${out}" | grep -m1 . | cut -c1-200)
-                [ -n "${state}" ] || state="no output from 'codex remote-control start'"
+        state=$(codex_rc_state "${sandbox_arg}")
+        if [[ "${state}" == *"${CODEX_UNTRACKED}"* ]]; then
+            # Logged every time, not only on change: each one comes with a
+            # recovery attempt, and a recovery that keeps being needed is
+            # exactly what somebody reading this log should see.
+            codex_log "${state}"
+            if reap_untracked_codex; then
+                state=$(codex_rc_state "${sandbox_arg}")
             fi
+            last=""
         fi
 
         if [ "${state}" != "${last}" ]; then

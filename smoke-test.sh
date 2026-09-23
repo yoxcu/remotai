@@ -15,6 +15,7 @@
 #   * adding a key on the host reaches the container without a restart
 #   * an extra_keys entry in users.yaml also gets in
 #   * no banned auth/telemetry variable leaks into the container
+#   * the container reaches api.anthropic.com and chatgpt.com over HTTPS
 #   * the Codex standalone install is shared from the image and linked into
 #     the user's ~/.codex, which is what `codex remote-control` insists on
 #   * the supervisor restarts the remote-control loop when it is killed,
@@ -234,6 +235,15 @@ fi
 check_out "projects bind mount is writable by dev" '^ok$' \
     ssh_cmd 'touch ~/projects/.smoke && echo ok && rm -f ~/projects/.smoke'
 
+say "6b. outbound network, as the agents see it"
+# Any HTTP status means the way out works. A container that cannot get out
+# looks healthy by every other check here — and nothing that needs an account
+# works. The usual cause is a host firewall restart wiping Docker's rules.
+for host in api.anthropic.com chatgpt.com; do
+    check_out "container reaches ${host} over HTTPS" '^[1-5][0-9][0-9]$' \
+        ssh_cmd "curl -s -m 10 -o /dev/null -w '%{http_code}' https://${host}/"
+done
+
 say "7. the supervised remote-control loop"
 # The throwaway user is deliberately not signed in, so the loop parks in its
 # "not signed in — run portal setup" branch. That still exercises every piece
@@ -280,6 +290,9 @@ fi
 check_out "sandbox_mode reaches the daemon command line" \
     'sandbox_mode=.danger-full-access.' \
     ssh_cmd 'cat ~/codex.log'
+
+check_out "portal status <name> produces its report" '^findings' \
+    ./portal status "${USER_NAME}"
 
 say "8. supervisor restarts what dies"
 before=$(ssh_cmd 'wc -l < ~/rc.log' 2>/dev/null | tr -d ' \r')

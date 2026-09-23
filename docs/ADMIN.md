@@ -135,6 +135,7 @@ in.
 ```sh
 ./portal status        # container state + both logins + both remote controls
 ./portal status -q     # skip the in-container probes (instant)
+./portal status alice  # one user in depth, ending in a list of findings
 ```
 
 | Column | What it is |
@@ -142,12 +143,26 @@ in.
 | `CLAUDE` | the claude.ai login, by auth method. `NO LOGIN` means the loop is idling — rerun `portal setup`. |
 | `LOOP` | the tmux session holding `claude remote-control`. |
 | `CODEX` | the ChatGPT login. |
-| `DAEMON` | the Codex app-server daemon. `up` = running with remote control on; `no-rc` = running but not reachable from a phone; `down` = not running. |
+| `DAEMON` | the Codex app-server daemon. `up` = running with remote control on; `no-rc` = running but not reachable from a phone; `orphan` = an app-server is running but the daemon has lost track of it (see Troubleshooting); `down` = not running. |
 | `SANDBOX` | the Codex `sandbox_mode`, or `default` for Codex's own. |
 
 The last line of each user's `~/rc.log` and `~/codex.log` is printed below the
 table. `status` only ever reads — it asks the Codex daemon its version rather
 than running `remote-control start`, so checking never starts anything.
+
+`./portal status <name>` is the first thing to run when one person says "it
+stopped working". In one go it shows:
+
+- the container, and whether its image is older than `agent-base:latest`
+- the settings it is running with, and any drift from `users.yaml`
+- CPU, memory and pids
+- **outbound HTTPS from inside the container**
+- both agents in detail: the Codex daemon's pid files and processes, and the
+  tails of `rc.log`, `codex.log` and Codex's own stderr log
+
+It ends with a list of findings, each saying what to do. The network check is
+the one to look at first. A container that cannot get out looks healthy
+everywhere else: logged in, daemon up, loop running, and yet nothing works.
 
 ---
 
@@ -537,6 +552,87 @@ The Codex desktop app follows `ProxyJump` fine.
 
 ---
 
+## Host firewall and Docker's rules
+
+Docker publishes ports and lets containers out through iptables rules of its own:
+a `MASQUERADE` rule in the nat table plus the `DOCKER*` chains. **Anything that
+flushes the ruleset removes them**, and Docker only puts them back when the
+daemon starts. On Manjaro/Arch `systemctl restart iptables` does exactly this,
+and so does a plain `iptables-restore` of a saved file, or any tool that
+reloads the whole ruleset.
+
+From that moment on, no container can reach the internet. Nothing crashes, so it
+looks like an agent problem everywhere:
+
+- `codex.log` goes `connecting`, then `Remote control is enabled … but the
+  connection is errored`
+- Codex's `app-server.stderr.log` repeats `failed to refresh available models:
+  timeout waiting for child process to exit`
+- phones show the container as last seen when the firewall was restarted
+
+`./portal status <name>` names the cause directly under "network". To confirm
+by hand:
+
+```sh
+docker exec work-alice curl -sS -m 10 -o /dev/null -w '%{http_code}\n' https://chatgpt.com/
+curl -sS -m 10 -o /dev/null -w '%{http_code}\n' https://chatgpt.com/     # the host itself
+sudo iptables -t nat -S POSTROUTING | grep -i masq                          # Docker's rule
+```
+
+If the host gets out, the container does not, and there is no `MASQUERADE` rule
+for Docker's subnets, this is the cause.
+
+**The fix is restarting the Docker daemon**, which recreates the rules. Do it
+with `live-restore` on, so containers, and any long computation inside them,
+keep running through the restart. Without it, a daemon restart stops every
+container.
+
+```sh
+# /etc/docker/daemon.json: add "live-restore": true (mind the comma if the
+# file already has entries). live-restore is one of the few settings a reload
+# applies, so this needs no restart yet.
+sudo jq . /etc/docker/daemon.json               # must parse
+sudo systemctl reload docker
+sudo journalctl -u docker -n 3 --no-pager       # "Error reloading configuration" = it did not take
+docker info --format '{{.LiveRestoreEnabled}}'  # must be true before the next step
+
+sudo systemctl restart docker
+```
+
+Two traps along the way:
+
+- **systemd reports "Reloaded" even when dockerd rejected the file.** Only the
+  journal and `docker info` tell the truth.
+- **Never restart the daemon with a `daemon.json` that does not parse.** dockerd
+  then does not start at all, and every container stays down.
+
+Leave live-restore on; it makes every later Docker upgrade safe for running work
+too.
+
+**Stopgap without touching the daemon.** Re-add the missing rules by hand. The
+next firewall restart removes them again, and the next Docker restart replaces
+them properly.
+
+```sh
+sudo sysctl -n net.ipv4.ip_forward          # must be 1
+for n in $(docker network ls --filter driver=bridge -q); do
+  sub=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$n")
+  br=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$n")
+  [ -n "$br" ] || br="br-$n"
+  sudo iptables -t nat -A POSTROUTING -s "$sub" ! -o "$br" -j MASQUERADE
+  sudo iptables -I FORWARD 1 -i "$br" ! -o "$br" -j ACCEPT
+  sudo iptables -I FORWARD 1 -o "$br" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+done
+```
+
+The rule to remember: **on this host, every firewall restart must be followed
+by a Docker restart.** Check the `DOCKER-USER` rules from "Exposing sshd safely"
+afterwards as well. They come back only if they are in the saved ruleset the
+firewall loads, and without them the containers' SSH ports are open to anyone
+who can reach the host.
+
+---
+
 ## Layout reference
 
 | Path | What |
@@ -576,7 +672,9 @@ environment variable it had to strip.
 | `permission_mode` set but sessions still prompt | Check the `remote control:` line in `docker logs`, and the `starting:` line in `rc.log`, for `--permission-mode=`. Env vars alone do not prove it arrived. |
 | `Worktree mode requires a git repository` in rc.log | `spawn: worktree` with a `workdir` that is not a repo. Set `spawn: same-dir`, or point `workdir` at a repo. Newer containers fall back automatically and say so. |
 | Codex app cannot start app-server | `ssh -T -p 2201 dev@host 'command -v codex'` must print `/usr/local/bin/codex` |
-| Container missing from the Codex phone app | `./portal status` — `DAEMON` should be `up`. Then `docker exec -it work-alice su -l dev -c 'tail -40 ~/codex.log'`; it logs every state change of the daemon. `./portal pair alice` for a fresh code. |
+| Every container went offline at the same moment; `codex.log` says `connecting`, then `connection is errored` | The containers cannot get out. See "Host firewall and Docker's rules": most likely the host firewall was restarted. `./portal status <name>` confirms it under "network". |
+| `app server is running but is not managed by codex app-server daemon` in `codex.log` | The daemon lost its pid files while its app-server kept running (`DAEMON` reads `orphan`). Nothing restarts that app-server any more, so once its connection drops the phone loses the container. A current `supervisor.sh` stops the daemon's untracked processes and starts clean on its next poll, and logs `recovery:` when it does. On an older image, `./portal status <name>` prints the exact `kill` to run. An app-server the desktop app started over SSH is left alone either way. |
+| Container missing from the Codex phone app | `./portal status <name>`, which checks the network, the daemon and its pid files together. `DAEMON` should be `up`. Then `docker exec -it work-alice su -l dev -c 'tail -40 ~/codex.log'`; it logs every state change of the daemon. `./portal pair alice` for a fresh code. |
 | `managed standalone Codex install not found` | The image predates the standalone install, or `~/.codex/packages/standalone` is not linked. `./portal update`, then check `~/codex.log` for the `linked …` line. |
 | `bwrap: No permissions to create a new namespace` in a session | Codex's sandbox cannot run inside these containers. See "Codex sandbox mode" — usually `sandbox_mode: danger-full-access`. |
 | `sandbox_mode` set but sessions behave the same | Check the `starting:` line in `~/codex.log` for the `-c sandbox_mode=` argument. If it is right, the daemon predates it: `remote-control start` reports `alreadyRunning` and does not re-read config. `codex app-server daemon restart` in the container, or `./portal update`, which recreates it. |

@@ -170,7 +170,7 @@ loop, if you have Claude enabled too. Leave it alone.
 | `codex` says you are not logged in | The one-time `codex login` did not complete — see section 3. |
 | `Please contact your workspace admin to enable device code authentication` | Your ChatGPT workspace blocks `--device-auth`. Use the SSH tunnel in section 3 instead. |
 | The container never shows up on your phone | Check you are signed into the same ChatGPT account in both places, then ask your admin for a pairing code (`./portal pair <you>`). They can also check `~/codex.log` in your container, which records every state change of the daemon. |
-| It showed up, then went quiet | Usually the container restarted. Give it a minute; the daemon is supervised and comes back on its own. |
+| It showed up, then went quiet | Usually the container restarted. Give it a minute; the daemon is supervised and comes back on its own. If it stays quiet, ask your admin to run `./portal status <you>`: it checks whether your container can reach the internet at all, which is the other common cause. |
 | Host key changed warning | Only expected if your container's home volume was recreated. Confirm with your admin before removing the old key. |
 
 ## 8. Please don't
